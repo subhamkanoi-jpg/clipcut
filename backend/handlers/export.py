@@ -4,9 +4,10 @@ import shutil
 from pathlib import Path
 
 import cloudinary_svc
+import reframe
 import worker
 from cut_state import compute_cut_state, now_iso
-from plan import assemble, render_plan
+from plan import assemble, materialize, render_plan
 from worker import Cancelled
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +42,14 @@ def run(ctx) -> dict:
         }})
 
     try:
+        if reel.get("aspect") == "9:16":
+            cb(5, "reframing")
+            subject_center_x = reframe.subject_center(Path(doc["video_path"]))
+            doc["subject_center_x"] = subject_center_x
+            ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+                "subject_center_x": subject_center_x,
+            }})
+
         state = compute_cut_state({**doc, "reel_settings": reel})
         edl = assemble.from_project({**doc, "caption_style": style_key}, state)
         meta = render_plan.render(
@@ -75,7 +84,7 @@ def run(ctx) -> dict:
         },
         "cloud": cloud,
     }})
-    shutil.rmtree(pdir / "work", ignore_errors=True)
+    shutil.rmtree(materialize.edit_dir(pdir) / "work", ignore_errors=True)
     return {"path": str(out_path)}
 
 
