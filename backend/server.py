@@ -2,9 +2,7 @@ import os
 import re
 import shutil
 import subprocess
-import threading
 import uuid
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -388,60 +386,9 @@ def start_export(pid: str, body: ExportBody):
         "reel_settings": reel,
         "export": {"status": "processing", "progress": 0, "error": None, "stage": "cutting"},
     }})
-    threading.Thread(target=_run_export, args=(pid, body.caption_style, reel), daemon=True).start()
-    return {"ok": True, "reel_settings": reel}
-
-
-def _run_export(pid: str, style_key: str, reel: dict):
-    doc = projects.find_one({"id": pid})
-    try:
-        state = compute_cut_state({**doc, "reel_settings": reel})
-        pdir = project_dir(pid)
-        out_path = pdir / "export.mp4"
-
-        def cb(p):
-            stage = "cutting" if p < 68 else ("captioning" if p < 90 else "mastering")
-            projects.update_one({"id": pid}, {"$set": {"export.progress": p, "export.stage": stage}})
-
-        meta = render_engine.render_export(
-            source=Path(doc["video_path"]),
-            words=doc.get("words") or [],
-            ranges=state["keep_ranges"],
-            style_key=style_key,
-            burn=reel["burn_captions"],
-            work_dir=pdir / "work",
-            out_path=out_path,
-            aspect=reel["aspect"],
-            cinematic=reel["cinematic"],
-            karaoke=reel["karaoke"],
-            zoom_intensity=reel["zoom_intensity"],
-            punch_ins=reel.get("punch_ins", True),
-            punch_sensitivity=reel.get("punch_sensitivity", 0.5),
-            progress_cb=cb,
-        )
-        cloud = {}
-        if cloudinary_svc.enabled():
-            try:
-                cloud = cloudinary_svc.upload_reel(
-                    out_path, public_id=f"reel_{pid}", reframe=reel["aspect"] == "9:16"
-                )
-            except Exception as e:
-                cloud = {"error": str(e)[:300]}
-        projects.update_one({"id": pid}, {"$set": {
-            "export": {
-                "status": "done", "progress": 100, "error": None, "stage": "done",
-                "path": str(out_path), "meta": meta,
-                "size": out_path.stat().st_size,
-                "finished_at": now_iso(),
-            },
-            "cloud": cloud,
-        }})
-        shutil.rmtree(pdir / "work", ignore_errors=True)
-    except Exception as e:
-        logging.exception("export failed for %s", pid)
-        projects.update_one({"id": pid}, {"$set": {
-            "export": {"status": "error", "progress": 0, "error": str(e)[:500], "stage": "failed"},
-        }})
+    jid = jobs.enqueue(db, pid, "export",
+                       {"caption_style": body.caption_style, "reel": reel})
+    return {"ok": True, "reel_settings": reel, "job_id": jid}
 
 
 @api.get("/projects/{pid}/export/download")
@@ -455,6 +402,22 @@ def download_export(pid: str):
         raise HTTPException(404, "export file missing")
     stem = Path(doc["filename"]).stem
     return FileResponse(path, media_type="video/mp4", filename=f"{stem}_reel.mp4")
+
+
+@api.get("/jobs/{jid}")
+def get_job(jid: str):
+    doc = db.jobs.find_one({"id": jid}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "job not found")
+    return doc
+
+
+@api.post("/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    if not db.jobs.find_one({"id": jid}, {"_id": 1}):
+        raise HTTPException(404, "job not found")
+    jobs.request_cancel(db, jid)
+    return {"ok": True}
 
 
 @api.get("/styles")

@@ -30,6 +30,7 @@ import jobs as jobs_mod
 # Importing handler modules registers them in HANDLERS. Keep after HANDLERS exists.
 def _register_handlers() -> None:
     import handlers.transcribe  # noqa: F401
+    import handlers.export      # noqa: F401
 
 POLL_S = 1.0
 
