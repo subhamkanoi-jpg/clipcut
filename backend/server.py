@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -18,8 +19,12 @@ from pymongo import MongoClient
 
 import cloudinary_svc
 import jobs
-import render_engine
+import probe as probe_mod
 from cut_state import DEFAULT_CUT_SETTINGS, DEFAULT_REEL, compute_cut_state, now_iso
+
+# helpers/ modules cross-import flatly, so the directory itself goes on the path.
+sys.path.insert(0, str(ROOT.parent / "helpers"))
+import captions_ass
 
 client = MongoClient(os.environ["MONGO_URL"])
 db = client[os.environ["DB_NAME"]]
@@ -142,7 +147,7 @@ def complete_upload(pid: str):
         raw_path.replace(video_path)
 
     try:
-        info = render_engine.probe(video_path)
+        info = probe_mod.probe(video_path)
     except Exception:
         shutil.rmtree(pdir, ignore_errors=True)
         projects.delete_one({"id": pid})
@@ -156,7 +161,7 @@ def complete_upload(pid: str):
         "height": info["height"],
     }})
     try:
-        render_engine.make_thumbnail(video_path, pdir / "thumb.jpg", min(1.0, info["duration"] / 2))
+        probe_mod.make_thumbnail(video_path, pdir / "thumb.jpg", min(1.0, info["duration"] / 2))
     except Exception:
         pass
     jobs.enqueue(db, pid, "transcribe")
@@ -205,7 +210,7 @@ def get_thumbnail(pid: str):
         if not source.exists():
             raise HTTPException(404, "thumbnail not found")
         try:
-            render_engine.make_thumbnail(source, path, min(1.0, (doc.get("duration") or 2) / 2))
+            probe_mod.make_thumbnail(source, path, min(1.0, (doc.get("duration") or 2) / 2))
         except Exception:
             raise HTTPException(404, "thumbnail not available")
     return FileResponse(path, media_type="image/jpeg")
@@ -251,7 +256,7 @@ class StyleBody(BaseModel):
 @api.post("/projects/{pid}/style")
 def set_style(pid: str, body: StyleBody):
     get_project_or_404(pid)
-    if body.caption_style not in render_engine.CAPTION_STYLES:
+    if body.caption_style not in captions_ass.CAPTION_STYLES:
         raise HTTPException(400, "unknown style")
     projects.update_one({"id": pid}, {"$set": {"caption_style": body.caption_style}})
     return {"ok": True}
@@ -333,7 +338,7 @@ def start_export(pid: str, body: ExportBody):
         raise HTTPException(400, "transcript not ready")
     if (doc.get("export") or {}).get("status") == "processing":
         raise HTTPException(400, "export already running")
-    if body.caption_style not in render_engine.CAPTION_STYLES:
+    if body.caption_style not in captions_ass.CAPTION_STYLES:
         raise HTTPException(400, "unknown style")
     reel = _clean_reel(ReelSettings(
         aspect=body.aspect, cinematic=body.cinematic, karaoke=body.karaoke,
@@ -382,7 +387,7 @@ def cancel_job(jid: str):
 
 @api.get("/styles")
 def list_styles():
-    return {"styles": list(render_engine.CAPTION_STYLES.keys())}
+    return {"styles": list(captions_ass.CAPTION_STYLES.keys())}
 
 
 @api.get("/cloudinary/status")

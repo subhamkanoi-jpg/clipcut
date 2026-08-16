@@ -4,9 +4,9 @@ import shutil
 from pathlib import Path
 
 import cloudinary_svc
-import render_engine
 import worker
 from cut_state import compute_cut_state, now_iso
+from plan import assemble, render_plan
 from worker import Cancelled
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,8 +34,7 @@ def run(ctx) -> dict:
         }})
         raise Cancelled()
 
-    def cb(p):
-        stage = "cutting" if p < 68 else ("captioning" if p < 90 else "mastering")
+    def cb(p, stage):
         ctx.progress(p, stage)
         ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
             "export.progress": p, "export.stage": stage,
@@ -43,21 +42,12 @@ def run(ctx) -> dict:
 
     try:
         state = compute_cut_state({**doc, "reel_settings": reel})
-        meta = render_engine.render_export(
-            source=Path(doc["video_path"]),
+        edl = assemble.from_project({**doc, "caption_style": style_key}, state)
+        meta = render_plan.render(
+            edl, pdir, out_path,
             words=doc.get("words") or [],
-            ranges=state["keep_ranges"],
-            style_key=style_key,
-            burn=reel["burn_captions"],
-            work_dir=pdir / "work",
-            out_path=out_path,
-            aspect=reel["aspect"],
-            cinematic=reel["cinematic"],
-            karaoke=reel["karaoke"],
-            zoom_intensity=reel["zoom_intensity"],
-            punch_ins=reel.get("punch_ins", True),
-            punch_sensitivity=reel.get("punch_sensitivity", 0.5),
             progress_cb=cb,
+            cancel_cb=ctx.cancelled,
         )
     except Exception as e:
         ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {

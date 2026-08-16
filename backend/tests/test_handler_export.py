@@ -43,8 +43,8 @@ def test_export_writes_done_state(db, monkeypatch, tmp_path):
 
     monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
     monkeypatch.setattr(
-        eh.render_engine, "render_export",
-        lambda **kw: {"width": 1080, "height": 1920, "duration": 9.0},
+        eh.render_plan, "render",
+        lambda *a, **kw: {"width": 1080, "height": 1920, "duration": 9.0},
     )
     monkeypatch.setattr(eh.cloudinary_svc, "enabled", lambda: False)
 
@@ -62,10 +62,10 @@ def test_export_failure_records_error_not_stuck_processing(db, monkeypatch, tmp_
     _project(db, "p2")
     monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
 
-    def boom(**kw):
+    def boom(*a, **kw):
         raise RuntimeError("ffmpeg exited 1")
 
-    monkeypatch.setattr(eh.render_engine, "render_export", boom)
+    monkeypatch.setattr(eh.render_plan, "render", boom)
     jobs_mod.enqueue(db, "p2", "export",
                      {"caption_style": "bold", "reel": dict(REEL)})
     worker_mod.run_once(db, "w1")
@@ -80,11 +80,11 @@ def test_export_honours_cancellation_before_render(db, monkeypatch, tmp_path):
     monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
     called = {"n": 0}
 
-    def counting(**kw):
+    def counting(*a, **kw):
         called["n"] += 1
         return {}
 
-    monkeypatch.setattr(eh.render_engine, "render_export", counting)
+    monkeypatch.setattr(eh.render_plan, "render", counting)
     jid = jobs_mod.enqueue(db, "p3", "export",
                            {"caption_style": "bold", "reel": dict(REEL)})
     jobs_mod.request_cancel(db, jid)
