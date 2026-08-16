@@ -2,8 +2,16 @@ import re
 from pathlib import Path
 
 PUNCT_BREAK = set(".,!?;:")
-FONT = "ClipCut Sans"          # bundled; see assets/fonts/ (Task 9)
+
+FONTS_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
+FONT_FILE = FONTS_DIR / "ClipCutSans-Bold.ttf"
+FONT = "DejaVu Sans"           # the family name inside the bundled TTF
 FONT_FALLBACK = "Liberation Sans"
+
+
+def font_available() -> bool:
+    return FONT_FILE.is_file()
+
 
 # ASS colours are &HAABBGGRR (style lines) / &HBBGGRR& (inline overrides)
 YELLOW = "&H00FFD4&"

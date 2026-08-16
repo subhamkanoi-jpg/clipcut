@@ -74,11 +74,19 @@ def test_escape_windows_drive():
     assert "master.srt" in escaped
 
 
-def test_default_font_windows(monkeypatch):
+def test_default_font_uses_bundled_family(monkeypatch):
+    # Task 9: font choice is deterministic (the bundled family), not a
+    # platform guess (previously "Arial" on win32 / "Helvetica" elsewhere).
+    import captions_ass
     monkeypatch.setattr(sys, "platform", "win32")
-    assert default_subtitle_font() == "Arial"
+    assert default_subtitle_font() == captions_ass.FONT
     monkeypatch.setattr(sys, "platform", "darwin")
-    assert default_subtitle_font() == "Helvetica"
+    assert default_subtitle_font() == captions_ass.FONT
+
+
+def test_default_font_falls_back_when_captions_ass_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "captions_ass", None)
+    assert default_subtitle_font() == "Liberation Sans"
 
 
 def test_force_style_uses_font():

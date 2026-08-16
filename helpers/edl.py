@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -94,7 +93,11 @@ def escape_subtitles_path(path: Path) -> str:
 
 
 def default_subtitle_font() -> str:
-    return "Arial" if sys.platform == "win32" else "Helvetica"
+    try:
+        import captions_ass
+        return captions_ass.FONT
+    except Exception:
+        return "Liberation Sans"
 
 
 def force_style(*, font: str | None = None, extra: str | None = None) -> str:
