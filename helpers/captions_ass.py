@@ -3,7 +3,12 @@ from pathlib import Path
 
 PUNCT_BREAK = set(".,!?;:")
 
-FONTS_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
+# A fonts-only subdirectory: ffmpeg's `subtitles` filter `fontsdir` option
+# makes libass try to load every file in the directory it points at as a
+# font candidate, so `assets/fonts/README.md` must NOT live in here (it
+# stays one level up, at `assets/fonts/README.md`) or libass logs
+# "Error opening memory font 'README.md'" on every burn.
+FONTS_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts" / "ttf"
 FONT_FILE = FONTS_DIR / "ClipCutSans-Bold.ttf"
 FONT = "DejaVu Sans"           # the family name inside the bundled TTF
 FONT_FALLBACK = "Liberation Sans"

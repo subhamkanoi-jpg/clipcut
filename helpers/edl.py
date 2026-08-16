@@ -93,11 +93,41 @@ def escape_subtitles_path(path: Path) -> str:
 
 
 def default_subtitle_font() -> str:
+    """The FontName to request in the burned-caption force_style.
+
+    Only ever names the bundled family (`captions_ass.FONT`) when the
+    bundled TTF is actually present on disk (`captions_ass.font_available()`)
+    -- libass silently substitutes a missing font rather than erroring, so
+    requesting a family we know isn't there would just reintroduce that
+    silent-substitution failure mode. Falls back to `captions_ass.FONT_FALLBACK`
+    (a family present on the target OSes) when the bundled file is missing,
+    and to a hardcoded "Liberation Sans" if `captions_ass` can't even be
+    imported.
+    """
     try:
         import captions_ass
-        return captions_ass.FONT
+        return captions_ass.FONT if captions_ass.font_available() else captions_ass.FONT_FALLBACK
     except Exception:
         return "Liberation Sans"
+
+
+def default_subtitle_fontsdir() -> Path | None:
+    """Directory ffmpeg's `subtitles` filter should search for the bundled
+    caption font, or None when the bundled TTF is not actually present.
+
+    Callers must check for None and omit the `fontsdir` filter option
+    entirely rather than pointing it at a directory with no matching font
+    (or one that doesn't exist) -- an unescaped/missing fontsdir value can
+    break filter parsing, and a fontsdir with nothing useful in it is
+    pointless.
+    """
+    try:
+        import captions_ass
+        if captions_ass.font_available():
+            return captions_ass.FONTS_DIR
+    except Exception:
+        pass
+    return None
 
 
 def force_style(*, font: str | None = None, extra: str | None = None) -> str:

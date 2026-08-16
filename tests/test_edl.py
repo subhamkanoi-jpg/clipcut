@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from edl import default_subtitle_font, escape_subtitles_path, force_style, validate_edl
+from edl import (
+    default_subtitle_font,
+    default_subtitle_fontsdir,
+    escape_subtitles_path,
+    force_style,
+    validate_edl,
+)
 
 
 def _edl(tmp: Path, **over):
@@ -87,6 +93,29 @@ def test_default_font_uses_bundled_family(monkeypatch):
 def test_default_font_falls_back_when_captions_ass_unavailable(monkeypatch):
     monkeypatch.setitem(sys.modules, "captions_ass", None)
     assert default_subtitle_font() == "Liberation Sans"
+
+
+def test_default_font_falls_back_when_bundled_file_missing(monkeypatch, tmp_path: Path):
+    # Fix pass (review finding): font_available() must actually gate the
+    # requested family, not just gate whether fontsdir is emitted -- asking
+    # for "DejaVu Sans" with no fontsdir is exactly the silent-substitution
+    # bug this task exists to close. Simulate absence by repointing
+    # captions_ass.FONT_FILE at a path that doesn't exist (never delete the
+    # real bundled font).
+    import captions_ass
+    monkeypatch.setattr(captions_ass, "FONT_FILE", tmp_path / "nonexistent.ttf")
+    assert default_subtitle_font() == captions_ass.FONT_FALLBACK
+
+
+def test_default_fontsdir_points_at_bundled_font_directory():
+    import captions_ass
+    assert default_subtitle_fontsdir() == captions_ass.FONTS_DIR
+
+
+def test_default_fontsdir_none_when_bundled_file_missing(monkeypatch, tmp_path: Path):
+    import captions_ass
+    monkeypatch.setattr(captions_ass, "FONT_FILE", tmp_path / "nonexistent.ttf")
+    assert default_subtitle_fontsdir() is None
 
 
 def test_force_style_uses_font():

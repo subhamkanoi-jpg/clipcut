@@ -48,9 +48,36 @@ except Exception:
 # baseline roughly 30% up from the bottom on any aspect — clear of the UI on
 # every major vertical-video platform. Do not drop this below ~75 without a
 # specific reason.
-from edl import force_style, escape_subtitles_path
+from edl import force_style, escape_subtitles_path, default_subtitle_fontsdir
 
 SUB_FORCE_STYLE = force_style()
+
+
+def subtitles_filter_clause(subs_path: Path, force_style_str: str) -> str:
+    """Build the ffmpeg `subtitles=...` filter clause for a burn call.
+
+    Always wires `fontsdir` at the bundled caption font's directory when
+    that font is actually present on disk (`edl.default_subtitle_fontsdir()`
+    re-checks this on every call, so it reflects the real filesystem state
+    rather than a value cached at import time). Without `fontsdir`, libass
+    resolves FontName against the system's font registry only -- if the
+    force_style's FontName names the bundled family and fontsdir is absent
+    or wrong, libass silently substitutes some other installed font instead
+    of erroring, which is exactly the failure mode this exists to prevent.
+
+    When the bundled font is unavailable, `fontsdir` is omitted entirely
+    (a fontsdir pointing at nothing/no matching font is worse than none) and
+    the caller is expected to have already requested a family that's
+    actually installed via `force_style_str` (see `edl.default_subtitle_font`).
+    """
+    subs_abs = escape_subtitles_path(subs_path)
+    clause = f"subtitles='{subs_abs}'"
+    fontsdir = default_subtitle_fontsdir()
+    if fontsdir is not None:
+        clause += f":fontsdir='{escape_subtitles_path(fontsdir)}'"
+    clause += f":force_style='{force_style_str}'"
+    return clause
+
 
 # -------- Helpers ------------------------------------------------------------
 
@@ -657,10 +684,8 @@ def build_final_composite(
 
     # Subtitles LAST — Rule 1
     if has_subs:
-        subs_abs = escape_subtitles_path(subtitles_path)
-        filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{force_style_str}'[outv]"
-        )
+        clause = subtitles_filter_clause(subtitles_path, force_style_str)
+        filter_parts.append(f"{current}{clause}[outv]")
         out_label = "[outv]"
     else:
         # Rename the last overlay output to [outv] for consistency
