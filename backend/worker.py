@@ -128,4 +128,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Re-enter under the module's real name. Handler modules do `import worker`,
+    # so running this file directly would otherwise create a second module object
+    # whose HANDLERS dict and Cancelled class are distinct from this one.
+    from worker import main as _main
+    _main()

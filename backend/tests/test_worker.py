@@ -1,6 +1,10 @@
 import logging
 import os
+import queue
+import subprocess
 import sys
+import threading
+import time
 
 import pytest
 from pymongo import MongoClient
@@ -9,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jobs as jobs_mod
 import worker as worker_mod
+
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture
@@ -112,3 +118,60 @@ def test_progress_warns_when_lease_lost(db, caplog):
         ctx.progress(10, "working")
 
     assert f"lost lease on job {jid}" in caplog.text
+
+
+def _pump_lines(stream, q):
+    for line in iter(stream.readline, ""):
+        q.put(line)
+    q.put(None)
+
+
+def test_running_as_script_registers_all_handlers():
+    # Regression test: worker.py is started with `python worker.py`, which
+    # makes its module name "__main__". Handler modules do `import worker`,
+    # which (if the __main__ block just calls main() directly) creates a
+    # SECOND, separate module object under the name "worker" -- with its own
+    # empty HANDLERS dict and its own Cancelled class. Handlers register into
+    # that second copy while main() reads the first copy's HANDLERS, which
+    # stays empty forever. This test launches worker.py exactly the way a
+    # user/deployment does -- as a real subprocess -- and checks that the
+    # startup log line actually lists the registered handlers.
+    proc = subprocess.Popen(
+        [sys.executable, "worker.py"],
+        cwd=BACKEND_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    out_q: queue.Queue = queue.Queue()
+    reader = threading.Thread(target=_pump_lines, args=(proc.stderr, out_q), daemon=True)
+    reader.start()
+    try:
+        deadline = time.time() + 30
+        ready_line = None
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            try:
+                line = out_q.get(timeout=max(0.1, remaining))
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            if "ready, handlers:" in line:
+                ready_line = line
+                break
+
+        assert ready_line is not None, (
+            "worker.py did not log a 'ready, handlers:' line within 30s "
+            "(process may have exited early or hung)"
+        )
+        assert "export" in ready_line, f"'export' missing from ready line: {ready_line!r}"
+        assert "transcribe" in ready_line, f"'transcribe' missing from ready line: {ready_line!r}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
