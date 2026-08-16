@@ -31,4 +31,26 @@ def write(plan: dict, project_dir: Path) -> Path:
 
 
 def clean(project_dir: Path) -> None:
-    shutil.rmtree(edit_dir(project_dir), ignore_errors=True)
+    """Delete the edit directory, with containment verification.
+
+    Raises ValueError if the project_dir contains path escape attempts (..)
+    or if the resolved edit path is not exactly a direct child named "edit".
+    """
+    project_dir_path = Path(project_dir)
+
+    # Reject paths containing ".." to prevent traversal attacks
+    if ".." in project_dir_path.parts:
+        raise ValueError(
+            f"Project directory path cannot contain '..' components: {project_dir_path}"
+        )
+
+    project_dir_resolved = project_dir_path.resolve()
+    edit_path_resolved = edit_dir(project_dir_path).resolve()
+
+    # Verify the edit path is a direct child of project_dir named exactly "edit"
+    if edit_path_resolved.name != "edit" or edit_path_resolved.parent != project_dir_resolved:
+        raise ValueError(
+            f"Edit path {edit_path_resolved} is not a direct child of {project_dir_resolved}"
+        )
+
+    shutil.rmtree(edit_path_resolved, ignore_errors=True)
