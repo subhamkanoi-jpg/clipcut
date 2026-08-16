@@ -164,6 +164,31 @@ def is_portrait_source(video: Path) -> bool:
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
+def cover_crop_filter(src_w: int, src_h: int, center_x: float = 0.5,
+                      draft: bool = False) -> str:
+    """Scale-to-cover then crop to a vertical canvas, keeping center_x in frame.
+
+    center_x is the subject's horizontal position as a fraction of source width.
+    The crop window is clamped so it never runs past either edge.
+    """
+    out_w, out_h = (720, 1280) if draft else (1080, 1920)
+    if not src_w or not src_h:
+        return f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}:x=0:y=0"
+
+    # Scale so both dimensions cover the canvas.
+    scale_f = max(out_w / src_w, out_h / src_h)
+    scaled_w = int(round(src_w * scale_f))
+    scaled_h = int(round(src_h * scale_f))
+    scaled_w += scaled_w % 2
+    scaled_h += scaled_h % 2
+
+    x = int(round(center_x * scaled_w - out_w / 2))
+    x = max(0, min(x, max(0, scaled_w - out_w)))
+    y = max(0, (scaled_h - out_h) // 4)  # bias upward; heads sit high in frame
+
+    return f"scale={scaled_w}:{scaled_h},crop={out_w}:{out_h}:x={x}:y={y}"
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -174,6 +199,7 @@ def extract_segment(
     draft: bool = False,
     zoom: float = 1.0,
     cover: bool = False,
+    center_x: float = 0.5,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -189,8 +215,8 @@ def extract_segment(
 
     portrait = is_portrait_source(source)
     if cover:
-        canvas = "720:1280" if draft else "1080:1920"
-        scale = f"scale={canvas}:force_original_aspect_ratio=increase,crop={canvas}"
+        size = probe_video_size(source) or (1920, 1080)
+        scale = cover_crop_filter(size[0], size[1], center_x, draft=draft)
     elif draft:
         scale = "scale=-2:1280" if portrait else "scale=1280:-2"
     else:
