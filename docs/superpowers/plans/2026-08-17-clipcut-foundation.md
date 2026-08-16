@@ -2192,10 +2192,21 @@ def test_both_renderers_agree(tmp_path):
     new_meta = render_plan.render(plan, tmp_path, new_out, words=WORDS)
 
     assert old_out.is_file() and new_out.is_file()
-    assert new_meta["width"] == old_meta["width"] == 1080
-    assert new_meta["height"] == old_meta["height"] == 1920
+
+    # Compare the rendered ARTIFACTS, not the renderers' self-reported metadata.
+    # The two return dicts have different shapes by design — render_export
+    # returns width/height/aspect/moves/punches/punch_count/center_x/
+    # caption_events and has never returned a duration — so probing both files
+    # is both the only apples-to-apples comparison and the stronger test.
+    old_probe = render_plan._probe_out(old_out)
+    new_probe = render_plan._probe_out(new_out)
+
+    assert new_probe["width"] == old_probe["width"] == 1080
+    assert new_probe["height"] == old_probe["height"] == 1920
     # Same cuts in, so durations must match within encoder/fade slop.
-    assert abs(new_meta["duration"] - old_meta["duration"]) < 0.25
+    assert abs(new_probe["duration"] - old_probe["duration"]) < 0.25
+    # Sanity-check the geometry the old renderer reported about itself too.
+    assert old_meta["width"] == 1080 and old_meta["height"] == 1920
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="fixture not generated")
