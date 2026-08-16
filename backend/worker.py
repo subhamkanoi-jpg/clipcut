@@ -104,6 +104,14 @@ def _handle_signal(signum, frame):
 
 
 def main() -> None:
+    # Helper modules (render.py, grade.py, pack_transcripts.py, ...) print
+    # progress lines containing Unicode characters like "→". On Windows the
+    # worker's stdout defaults to cp1252, which can't encode them, crashing
+    # the job. Reconfigure stdio before anything can print or a job can be
+    # claimed.
+    from stdio import configure_stdio
+    configure_stdio()
+
     _register_handlers()
     client = MongoClient(os.environ["MONGO_URL"])
     db = client[os.environ["DB_NAME"]]
