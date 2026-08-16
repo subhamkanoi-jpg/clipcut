@@ -21,8 +21,8 @@ from pymongo import MongoClient
 
 import cloudinary_svc
 import cuts as cuts_mod
+import jobs
 import render_engine
-import transcription
 import zooms
 
 client = MongoClient(os.environ["MONGO_URL"])
@@ -201,22 +201,8 @@ def complete_upload(pid: str):
         render_engine.make_thumbnail(video_path, pdir / "thumb.jpg", min(1.0, info["duration"] / 2))
     except Exception:
         pass
-    threading.Thread(target=_run_transcription, args=(pid,), daemon=True).start()
+    jobs.enqueue(db, pid, "transcribe")
     return {"ok": True, "status": "transcribing", "duration": info["duration"]}
-
-
-def _run_transcription(pid: str):
-    doc = projects.find_one({"id": pid})
-    try:
-        payload = transcription.transcribe_video(Path(doc["video_path"]))
-        words = payload.get("words") or []
-        projects.update_one({"id": pid}, {"$set": {
-            "status": "ready",
-            "words": words,
-            "text": payload.get("text") or "",
-        }})
-    except Exception as e:
-        projects.update_one({"id": pid}, {"$set": {"status": "error", "error": str(e)[:500]}})
 
 
 # ---------- Project library ----------

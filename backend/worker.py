@@ -27,6 +27,10 @@ from pymongo import MongoClient
 
 import jobs as jobs_mod
 
+# Importing handler modules registers them in HANDLERS. Keep after HANDLERS exists.
+def _register_handlers() -> None:
+    import handlers.transcribe  # noqa: F401
+
 POLL_S = 1.0
 
 logging.basicConfig(
@@ -99,6 +103,7 @@ def _handle_signal(signum, frame):
 
 
 def main() -> None:
+    _register_handlers()
     client = MongoClient(os.environ["MONGO_URL"])
     db = client[os.environ["DB_NAME"]]
     worker_id = f"{socket.gethostname()}-{os.getpid()}"
