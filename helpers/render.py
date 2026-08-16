@@ -173,7 +173,7 @@ def cover_crop_filter(src_w: int, src_h: int, center_x: float = 0.5,
     """
     out_w, out_h = (720, 1280) if draft else (1080, 1920)
     if not src_w or not src_h:
-        return f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}:x=0:y=0"
+        return f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}"
 
     # Scale so both dimensions cover the canvas.
     scale_f = max(out_w / src_w, out_h / src_h)
@@ -184,7 +184,7 @@ def cover_crop_filter(src_w: int, src_h: int, center_x: float = 0.5,
 
     x = int(round(center_x * scaled_w - out_w / 2))
     x = max(0, min(x, max(0, scaled_w - out_w)))
-    y = max(0, (scaled_h - out_h) // 4)  # bias upward; heads sit high in frame
+    y = max(0, (scaled_h - out_h) // 2)
 
     return f"scale={scaled_w}:{scaled_h},crop={out_w}:{out_h}:x={x}:y={y}"
 
@@ -215,8 +215,15 @@ def extract_segment(
 
     portrait = is_portrait_source(source)
     if cover:
-        size = probe_video_size(source) or (1920, 1080)
-        scale = cover_crop_filter(size[0], size[1], center_x, draft=draft)
+        size = probe_video_size(source)
+        # Only feed concrete pixel dimensions to cover_crop_filter when the
+        # probe actually succeeded. On probe failure, pass (0, 0) so its own
+        # `not src_w or not src_h` guard returns the aspect-safe, ffmpeg-native
+        # scale+crop string (force_original_aspect_ratio=increase) instead of
+        # emitting concrete numbers computed from a guessed size — guessing
+        # would stretch the frame whenever the real source isn't 16:9.
+        src_w, src_h = size if size else (0, 0)
+        scale = cover_crop_filter(src_w, src_h, center_x, draft=draft)
     elif draft:
         scale = "scale=-2:1280" if portrait else "scale=1280:-2"
     else:
