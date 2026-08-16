@@ -70,3 +70,10 @@ library/photos/*.png
 *.env
 credentials.json
 .credentials
+
+# Local dev venv (created during ClipCut setup)
+.venv-local/
+
+# Runtime-generated project media and scratch
+backend/data/
+backend/test_output.txt
