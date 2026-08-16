@@ -69,13 +69,25 @@ def subtitles_filter_clause(subs_path: Path, force_style_str: str) -> str:
     (a fontsdir pointing at nothing/no matching font is worse than none) and
     the caller is expected to have already requested a family that's
     actually installed via `force_style_str` (see `edl.default_subtitle_font`).
+
+    `force_style` is only appended for `.srt` inputs. An `.srt` file carries
+    no styling of its own, so force_style is what gives it any style at all.
+    An `.ass` file (see `captions_ass.build_ass`) already carries a fully
+    computed `[V4+ Styles]` line -- correct FontSize, MarginV, colours, etc.
+    for the target resolution. libass's `force_style` overrides style lines
+    defined *inside* the subtitle file, so applying it to an `.ass` input
+    would stomp that computed styling (e.g. FontSize 105 -> 18, MarginV
+    288 -> 90) with the generic SRT defaults. `fontsdir` has no such
+    conflict -- it only affects font *lookup*, not styling -- so it is
+    always emitted regardless of subtitle format.
     """
     subs_abs = escape_subtitles_path(subs_path)
     clause = f"subtitles='{subs_abs}'"
     fontsdir = default_subtitle_fontsdir()
     if fontsdir is not None:
         clause += f":fontsdir='{escape_subtitles_path(fontsdir)}'"
-    clause += f":force_style='{force_style_str}'"
+    if subs_path.suffix.lower() != ".ass":
+        clause += f":force_style='{force_style_str}'"
     return clause
 
 
