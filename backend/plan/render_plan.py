@@ -31,10 +31,12 @@ def _probe_out(path: Path) -> dict:
     }
 
 
-def _extract_all(plan, project_dir, work_dir, cover, center_x):
+def _extract_all(plan, work_dir, cover, center_x, check_cancel=None):
     sources = plan["sources"]
     paths = []
     for i, r in enumerate(plan["ranges"]):
+        if check_cancel:
+            check_cancel()
         seg = work_dir / f"seg_{i:04d}.mp4"
         helpers_render.extract_segment(
             Path(sources[r["source"]]),
@@ -93,7 +95,7 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
 
     check_cancel()
     tick(10, "cutting")
-    segments = _extract_all(plan, project_dir, work_dir, cover, center_x)
+    segments = _extract_all(plan, work_dir, cover, center_x, check_cancel)
 
     check_cancel()
     tick(55, "compositing")
@@ -105,20 +107,28 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
         check_cancel()
         tick(70, "captioning")
         probe = _probe_out(base)
-        subs_path = edit_dir / "captions.ass"
+        candidate_subs_path = edit_dir / "captions.ass"
         style = captions_ass.CAPTION_STYLES.get(
             caps.get("style", "bold"), captions_ass.CAPTION_STYLES["bold"]
         )
-        captions_ass.build_ass(
+        caption_count = captions_ass.build_ass(
             words,
             # captions_ass.timeline_chunks unpacks `for r_start, r_end in ranges`,
             # so these must be (start, end) TUPLES, not dicts. EDL v2 ranges are
             # dicts, so convert here.
             [(r["start"], r["end"]) for r in plan["ranges"]],
-            subs_path, style, probe["width"], probe["height"],
+            candidate_subs_path, style, probe["width"], probe["height"],
             karaoke=bool(caps.get("karaoke", True)),
             fonts_dir=captions_ass.FONTS_DIR,
         )
+        # build_ass writes an empty, headerless 0-byte file and returns 0 when
+        # none of the kept ranges overlap any transcribed word. helpers/render.py
+        # decides has_subs purely from subs_path.exists(), so an empty file would
+        # still produce a `subtitles=<empty file>` ffmpeg clause. Only hand the
+        # path onward when there is something to burn, matching render_engine.py's
+        # `if caption_count: burn_captions(...)` guard.
+        if caption_count:
+            subs_path = candidate_subs_path
     else:
         tick(70, "captioning")
 
