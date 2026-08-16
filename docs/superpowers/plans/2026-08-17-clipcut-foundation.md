@@ -2051,7 +2051,10 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
         )
         captions_ass.build_ass(
             words,
-            [{"start": r["start"], "end": r["end"]} for r in plan["ranges"]],
+            # captions_ass.timeline_chunks unpacks `for r_start, r_end in ranges`,
+            # so these must be (start, end) TUPLES, not dicts. EDL v2 ranges are
+            # dicts, so convert here.
+            [(r["start"], r["end"]) for r in plan["ranges"]],
             subs_path, style, probe["width"], probe["height"],
             karaoke=bool(caps.get("karaoke", True)),
             fonts_dir=captions_ass.FONTS_DIR,
