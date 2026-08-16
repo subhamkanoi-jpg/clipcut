@@ -1,12 +1,12 @@
 """Export job: cut, caption, master, optionally push to Cloudinary."""
 
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cloudinary_svc
 import render_engine
 import worker
+from cut_state import compute_cut_state, now_iso
 from worker import Cancelled
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,13 +17,7 @@ def project_dir(pid: str) -> Path:
     return DATA_DIR / pid
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def run(ctx) -> dict:
-    from server import compute_cut_state  # imported lazily; server owns cut math
-
     doc = ctx.db.projects.find_one({"id": ctx.project_id})
     if not doc:
         raise RuntimeError(f"project {ctx.project_id} not found")
@@ -34,6 +28,10 @@ def run(ctx) -> dict:
     out_path = pdir / "export.mp4"
 
     if ctx.cancelled():
+        ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+            "export": {"status": "cancelled", "progress": 0,
+                       "error": None, "stage": "cancelled"},
+        }})
         raise Cancelled()
 
     def cb(p):
@@ -83,7 +81,7 @@ def run(ctx) -> dict:
             "status": "done", "progress": 100, "error": None, "stage": "done",
             "path": str(out_path), "meta": meta,
             "size": out_path.stat().st_size,
-            "finished_at": _now_iso(),
+            "finished_at": now_iso(),
         },
         "cloud": cloud,
     }})

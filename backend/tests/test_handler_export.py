@@ -92,3 +92,8 @@ def test_export_honours_cancellation_before_render(db, monkeypatch, tmp_path):
 
     assert called["n"] == 0
     assert db.jobs.find_one({"id": jid})["status"] == "cancelled"
+    exp = db.projects.find_one({"id": "p3"})["export"]
+    assert exp["status"] == "cancelled"
+    assert exp["progress"] == 0
+    assert exp["error"] is None
+    assert exp["stage"] == "cancelled"
