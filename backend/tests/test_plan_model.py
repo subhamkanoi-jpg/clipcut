@@ -69,3 +69,10 @@ def test_validate_rejects_center_x_out_of_range():
     p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
     p["reframe"]["center_x"] = 1.7
     assert any("center_x" in e for e in model.validate(p))
+
+
+def test_validate_rejects_wrong_version():
+    p = model.new_plan("p1", "s.mp4")
+    p["version"] = 1
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert any("version" in e for e in model.validate(p))
