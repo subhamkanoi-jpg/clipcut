@@ -124,3 +124,12 @@ def test_set_progress_updates_fields(db):
     assert doc["progress"] == 42
     assert isinstance(doc["progress"], int)
     assert doc["stage"] == "cutting"
+
+
+def test_cancel_sets_terminal_status(db):
+    jid = jobs_mod.enqueue(db, "proj1", "render")
+    jobs_mod.cancel(db, jid)
+    doc = db.jobs.find_one({"id": jid})
+    assert doc["status"] == "cancelled"
+    assert doc["stage"] == "cancelled"
+    assert doc["finished_at"] is not None

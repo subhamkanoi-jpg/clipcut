@@ -92,6 +92,14 @@ def fail(db, job_id: str, error: str) -> None:
     }})
 
 
+def cancel(db, job_id: str) -> None:
+    db.jobs.update_one({"id": job_id}, {"$set": {
+        "status": "cancelled",
+        "stage": "cancelled",
+        "finished_at": _now(),
+    }})
+
+
 def request_cancel(db, job_id: str) -> None:
     db.jobs.update_one({"id": job_id}, {"$set": {"cancel_requested": True}})
 

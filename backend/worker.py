@@ -28,7 +28,6 @@ from pymongo import MongoClient
 import jobs as jobs_mod
 
 POLL_S = 1.0
-HEARTBEAT_S = 5.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +47,12 @@ class Ctx:
 
     def progress(self, p: int, stage: str) -> None:
         jobs_mod.set_progress(self.db, self.job["id"], p, stage)
-        jobs_mod.heartbeat(self.db, self.job["id"])
+        leased = jobs_mod.heartbeat(self.db, self.job["id"])
+        if not leased:
+            log.warning(
+                "lost lease on job %s; another worker may have reclaimed it",
+                self.job["id"],
+            )
 
     def cancelled(self) -> bool:
         return jobs_mod.is_cancelled(self.db, self.job["id"])
@@ -80,9 +84,7 @@ def run_once(db, worker_id: str) -> bool:
         result = handler(ctx)
         jobs_mod.finish(db, job["id"], result or {})
     except Cancelled:
-        db.jobs.update_one({"id": job["id"]}, {"$set": {
-            "status": "cancelled", "stage": "cancelled",
-        }})
+        jobs_mod.cancel(db, job["id"])
         log.info("job %s cancelled", job["id"])
     except Exception as e:
         log.exception("job %s failed", job["id"])

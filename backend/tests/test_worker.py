@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 
@@ -82,3 +83,32 @@ def test_ctx_cancelled_reflects_flag(db):
         assert observed == {"before": False, "after": True}
     finally:
         del worker_mod.HANDLERS["dummy"]
+
+
+def test_handler_raising_cancelled_marks_job_cancelled(db):
+    def handler(ctx):
+        raise worker_mod.Cancelled()
+
+    worker_mod.HANDLERS["dummy"] = handler
+    try:
+        jid = jobs_mod.enqueue(db, "proj1", "dummy")
+        worker_mod.run_once(db, "w1")
+        doc = db.jobs.find_one({"id": jid})
+        assert doc["status"] == "cancelled"
+        assert doc["stage"] == "cancelled"
+        assert doc["finished_at"] is not None
+    finally:
+        del worker_mod.HANDLERS["dummy"]
+
+
+def test_progress_warns_when_lease_lost(db, caplog):
+    jid = jobs_mod.enqueue(db, "proj1", "render")
+    job = jobs_mod.claim(db, ["render"], "worker-a")
+    # Simulate another worker reclaiming/finishing the job so our lease is lost.
+    db.jobs.update_one({"id": jid}, {"$set": {"status": "queued"}})
+
+    ctx = worker_mod.Ctx(db=db, job=job, project_id=job["project_id"], payload={})
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        ctx.progress(10, "working")
+
+    assert f"lost lease on job {jid}" in caplog.text
