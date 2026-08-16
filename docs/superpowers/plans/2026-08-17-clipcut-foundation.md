@@ -1483,6 +1483,14 @@ This is a move, not a rewrite. Copy `timeline_chunks`, `build_ass`, `_ass_ts`,
 `_clean`, `CAPTION_STYLES`, and the colour constants from
 `backend/render_engine.py` unchanged, then add the `fonts_dir` parameter.
 
+**Transitional duplication is expected here.** From this task until Task 12, this
+logic exists in both `helpers/captions_ass.py` and `backend/render_engine.py`.
+That is deliberate: Task 12's parity test renders through *both* renderers and
+compares them, which requires both to still exist. The duplicate is deleted in
+Task 12 Step 5 along with the rest of `render_engine.py`. Do not try to resolve
+it earlier by having one import from the other — that would couple the module
+being deleted to the module replacing it.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/test_captions_ass.py`:
@@ -2142,7 +2150,11 @@ CUT_STATE = {"keep_ranges": [(0.0, 2.0), (2.8, 4.5)], "kept_duration": 3.7}
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="fixture not generated")
-def test_new_renderer_produces_expected_geometry(tmp_path):
+def test_both_renderers_agree(tmp_path):
+    """The actual gate: old and new renderer must produce the same geometry
+    and duration from identical input. This is what licenses the deletion."""
+    import render_engine  # still present at this point in the plan
+
     doc = {
         "id": "parity",
         "video_path": str(FIXTURE),
@@ -2153,16 +2165,34 @@ def test_new_renderer_produces_expected_geometry(tmp_path):
             "burn_captions": True,
         },
     }
+
+    old_out = tmp_path / "old.mp4"
+    old_meta = render_engine.render_export(
+        source=FIXTURE,
+        words=WORDS,
+        ranges=CUT_STATE["keep_ranges"],
+        style_key="bold",
+        burn=True,
+        work_dir=tmp_path / "work_old",
+        out_path=old_out,
+        aspect="9:16",
+        cinematic=False,
+        karaoke=True,
+        zoom_intensity=1.0,
+        punch_ins=False,
+        punch_sensitivity=0.5,
+        progress_cb=lambda p: None,
+    )
+
+    new_out = tmp_path / "new.mp4"
     plan = assemble.from_project(doc, CUT_STATE)
-    out = tmp_path / "out.mp4"
+    new_meta = render_plan.render(plan, tmp_path, new_out, words=WORDS)
 
-    meta = render_plan.render(plan, tmp_path, out, words=WORDS)
-
-    assert out.is_file()
-    assert meta["width"] == 1080
-    assert meta["height"] == 1920
-    # 3.7s of kept material, allowing for keyframe and fade slop.
-    assert abs(meta["duration"] - 3.7) < 0.5
+    assert old_out.is_file() and new_out.is_file()
+    assert new_meta["width"] == old_meta["width"] == 1080
+    assert new_meta["height"] == old_meta["height"] == 1920
+    # Same cuts in, so durations must match within encoder/fade slop.
+    assert abs(new_meta["duration"] - old_meta["duration"]) < 0.25
 
 
 @pytest.mark.skipif(not FIXTURE.is_file(), reason="fixture not generated")
