@@ -106,11 +106,19 @@ def _reconcile_export_project(db, project_id: str, status: str, error: str | Non
     }})
 
 
+def _reconcile_plan_project(db, project_id: str, status: str, error: str | None) -> None:
+    # A stranded plan job should not leave plan_status at "planning".
+    db.projects.update_one({"id": project_id}, {"$set": {
+        "plan_status": "error" if status == "error" else status,
+    }})
+
+
 # kind -> function(db, project_id, status, error). Add an entry here whenever
 # a new job kind gets its own project sub-document shape.
 PROJECT_RECONCILERS = {
     "transcribe": _reconcile_transcribe_project,
     "export": _reconcile_export_project,
+    "plan": _reconcile_plan_project,
 }
 
 

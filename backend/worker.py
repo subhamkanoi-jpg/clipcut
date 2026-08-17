@@ -32,6 +32,7 @@ from errors import Cancelled
 def _register_handlers() -> None:
     import handlers.transcribe  # noqa: F401
     import handlers.export      # noqa: F401
+    import handlers.plan        # noqa: F401
 
 POLL_S = 1.0
 

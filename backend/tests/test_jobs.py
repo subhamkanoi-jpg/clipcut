@@ -169,11 +169,13 @@ def test_fail_reconciles_transcribe_project_out_of_processing(db):
 
 
 def test_fail_ignores_unknown_kind_project_shape(db):
-    # A kind with no registered reconciler (e.g. a not-yet-deployed "plan"
-    # kind) must not blow up -- there's no project schema to reconcile
-    # against, so this is a safe no-op rather than an error.
+    # A kind with no registered reconciler (e.g. a not-yet-deployed kind)
+    # must not blow up -- there's no project schema to reconcile against,
+    # so this is a safe no-op rather than an error. "plan" itself now has a
+    # reconciler (see PROJECT_RECONCILERS in jobs.py / test_handler_plan.py),
+    # so use a kind that genuinely has none to keep testing this fallback.
     db.projects.insert_one({"id": "p3"})
-    jid = jobs_mod.enqueue(db, "p3", "plan")
+    jid = jobs_mod.enqueue(db, "p3", "not_a_real_kind")
     jobs_mod.fail(db, jid, "boom")
     assert db.jobs.find_one({"id": jid})["status"] == "error"
     doc = db.projects.find_one({"id": "p3"}, {"_id": 0})
