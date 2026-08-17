@@ -259,3 +259,31 @@ def test_export_attaches_stored_plan_overlays(db, monkeypatch, tmp_path):
     jobs_mod.enqueue(db, "pov", "export", {"caption_style": "bold", "reel": dict(REEL)})
     worker_mod.run_once(db, "w1")
     assert captured["overlays"] and captured["overlays"][0]["id"] == "ov1"
+
+
+def test_export_excludes_disabled_overlays(db, monkeypatch, tmp_path):
+    _project(db, "povd")
+    captured = {}
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+
+    def fake_render(edl, pdir, out, words, progress_cb=None, cancel_cb=None):
+        captured["overlays"] = edl.get("overlays")
+        out.write_bytes(b"v")
+        return {"width": 1080, "height": 1920, "duration": 9.0}
+
+    monkeypatch.setattr(eh.render_plan, "render", fake_render)
+    monkeypatch.setattr(eh.cloudinary_svc, "enabled", lambda: False)
+    db.projects.update_one({"id": "povd"}, {"$set": {"plan": {
+        "version": 2, "overlays": [
+            {"id": "ov-on", "kind": "broll", "start_in_output": 1.0, "duration": 2.0,
+             "enabled": True, "locked": False, "file": None, "query": "x", "source": "mixkit"},
+            {"id": "ov-off", "kind": "broll", "start_in_output": 3.0, "duration": 2.0,
+             "enabled": False, "locked": False, "file": None, "query": "y", "source": "mixkit"},
+        ],
+    }}})
+    jobs_mod.enqueue(db, "povd", "export", {"caption_style": "bold", "reel": dict(REEL)})
+    worker_mod.run_once(db, "w1")
+
+    ids = [o["id"] for o in captured["overlays"]]
+    assert ids == ["ov-on"]
+    assert "ov-off" not in ids
