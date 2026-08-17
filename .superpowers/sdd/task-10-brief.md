@@ -1,110 +1,135 @@
-### Task 10: approve + preview + final render
+### Task 10: Build an EDL v2 from current project state
 
 **Files:**
-- Modify: `app/server/jobs.py`
-- Modify: `app/server/main.py`
-- Modify: `tests/test_jobs.py`
-- Modify: `tests/test_api.py`
+- Create: `backend/plan/assemble.py`
+- Create: `backend/tests/test_assemble.py`
 
 **Interfaces:**
-- Consumes: `stream_claude`, `validate_edl`, `run_helper("render.py", ...)`
-- Produces:
+- Consumes: `plan.model` (Task 5); `cuts.compute_spans` and the existing `compute_cut_state` shape.
+- Produces: `plan.assemble.from_project(doc: dict, cut_state: dict) -> dict` returning a validated EDL v2 whose `ranges` mirror `cut_state["keep_ranges"]`, whose `reframe`/`captions` come from the project's `reel_settings` and `caption_style`, and whose `overlays` are empty (populated in plan 2).
+
+- [ ] **Step 1: Write the failing test**
+
+Create `backend/tests/test_assemble.py`:
 
 ```python
-def start_approve_and_preview(folder: Path) -> dict
-# 1) stream_claude(APPROVE_PROMPT)
-# 2) load edit/edl.json; validate_edl; if not ok: last_error = join(errors); return
-# 3) set edl_mtime_at_approve, chat_after_approve=False, edl_approved_at=now
-# 4) start_render(folder, preview=True)
+import os
+import sys
 
-def start_render(folder: Path, *, preview: bool) -> dict
-# 409/RuntimeError if busy
-# validate EDL first; never call ffmpeg on invalid
-# preview: helpers/render.py edit/edl.json -o edit/preview.mp4 --preview
-#          plus --build-subtitles if edl has subtitles and (master.srt missing or older than edl)
-# final:   helpers/render.py edit/edl.json -o edit/final.mp4  (same subtitle rule)
-# on CalledProcessError: last_error = last 40 lines of stderr; leave preview.mp4 in place
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from plan import assemble, model
+
+DOC = {
+    "id": "p1",
+    "video_path": "/data/p1/source.mp4",
+    "caption_style": "neon",
+    "reel_settings": {
+        "aspect": "9:16", "cinematic": True, "karaoke": True,
+        "zoom_intensity": 1.0, "punch_ins": True, "punch_sensitivity": 0.5,
+        "burn_captions": True,
+    },
+}
+CUT_STATE = {
+    "keep_ranges": [(0.0, 2.4), (3.1, 6.0)],
+    "kept_duration": 5.3,
+}
+
+
+def test_ranges_mirror_keep_ranges():
+    p = assemble.from_project(DOC, CUT_STATE)
+    assert len(p["ranges"]) == 2
+    assert p["ranges"][0]["start"] == 0.0
+    assert p["ranges"][0]["end"] == 2.4
+    assert p["ranges"][1]["source"] == "main"
+
+
+def test_captions_come_from_project_settings():
+    p = assemble.from_project(DOC, CUT_STATE)
+    assert p["captions"]["style"] == "neon"
+    assert p["captions"]["karaoke"] is True
+    assert p["captions"]["burn"] is True
+
+
+def test_reframe_aspect_comes_from_reel_settings():
+    p = assemble.from_project(DOC, CUT_STATE)
+    assert p["reframe"]["aspect"] == "9:16"
+
+
+def test_original_aspect_is_preserved():
+    doc = {**DOC, "reel_settings": {**DOC["reel_settings"], "aspect": "original"}}
+    assert assemble.from_project(doc, CUT_STATE)["reframe"]["aspect"] == "original"
+
+
+def test_total_duration_is_the_sum_of_ranges():
+    p = assemble.from_project(DOC, CUT_STATE)
+    assert abs(p["total_duration_s"] - 5.3) < 0.01
+
+
+def test_output_validates():
+    assert model.validate(assemble.from_project(DOC, CUT_STATE)) == []
+
+
+def test_center_x_defaults_to_half_when_absent():
+    assert assemble.from_project(DOC, CUT_STATE)["reframe"]["center_x"] == 0.5
+
+
+def test_center_x_is_carried_through_when_present():
+    doc = {**DOC, "subject_center_x": 0.27}
+    assert assemble.from_project(doc, CUT_STATE)["reframe"]["center_x"] == 0.27
 ```
 
-Routes:
+- [ ] **Step 2: Run test to verify it fails**
 
-- `POST /api/approve` → 202
-- `POST /api/render-final` → 202
-- `GET /api/media/preview` → FileResponse `edit/preview.mp4` or 404
-- `GET /api/media/source/{name}` → FileResponse of that source or 404
-- `GET /api/media/final` → FileResponse `edit/final.mp4` or 404
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_assemble.py -v`
+Expected: FAIL — `ImportError: cannot import name 'assemble'`
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 3: Write minimal implementation**
 
-Add to `tests/test_jobs.py`:
+Create `backend/plan/assemble.py`:
 
 ```python
-from app.server.jobs import start_render
-from app.server.session import default_session, save_session
+"""Turn a project document plus computed cuts into an EDL v2."""
+
+from plan import model
 
 
-def test_start_render_rejects_invalid_edl(tmp_path: Path, monkeypatch):
-    (tmp_path / "a.mp4").write_bytes(b"x")
-    edit = tmp_path / "edit"
-    edit.mkdir()
-    (edit / "edl.json").write_text('{"sources":{},"ranges":[]}', encoding="utf-8")
-    save_session(tmp_path, default_session(tmp_path))
-    called = {"n": 0}
-    from app.server import proc as proc_mod
-    monkeypatch.setattr(proc_mod, "run_helper", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
-    with pytest.raises(RuntimeError, match="invalid"):
-        start_render(tmp_path, preview=True)
-    assert called["n"] == 0
+def from_project(doc: dict, cut_state: dict) -> dict:
+    plan = model.new_plan(doc["id"], doc.get("video_path") or "")
+    reel = doc.get("reel_settings") or {}
+
+    ranges = []
+    total = 0.0
+    for start, end in cut_state.get("keep_ranges") or []:
+        start = float(start)
+        end = float(end)
+        ranges.append({"source": "main", "start": start, "end": end, "zoom": 1.0})
+        total += end - start
+    plan["ranges"] = ranges
+    plan["total_duration_s"] = round(total, 3)
+
+    plan["reframe"] = {
+        "aspect": reel.get("aspect", "9:16"),
+        "center_x": float(doc.get("subject_center_x", 0.5)),
+    }
+    plan["captions"] = {
+        "style": doc.get("caption_style", "bold"),
+        "karaoke": bool(reel.get("karaoke", True)),
+        "burn": bool(reel.get("burn_captions", True)),
+    }
+    return plan
 ```
 
-Add to `tests/test_api.py`:
+- [ ] **Step 4: Run test to verify it passes**
 
-```python
-def test_approve_route_exists(client: TestClient, tmp_path: Path, monkeypatch):
-    (tmp_path / "take.mp4").write_bytes(b"x")
-    (tmp_path / "edit").mkdir()
-    (tmp_path / "edit" / "takes_packed.md").write_text("x", encoding="utf-8")
-    client.post("/api/folder", json={"path": str(tmp_path)})
-    import app.server.main as main_mod
-    monkeypatch.setattr(main_mod, "start_approve_and_preview", lambda folder: {"accepted": True})
-    r = client.post("/api/approve")
-    assert r.status_code == 202
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_jobs.py tests/test_api.py -v`
-
-Expected: FAIL — `start_render` / `/api/approve` missing
-
-- [ ] **Step 3: Implement approve + render**
-
-In `start_render`, after a successful preview, do not clear `preview.mp4` on a later failure. Write ffmpeg stderr to `edit/render.log`.
-
-Subtitle flag:
-
-```python
-def should_build_subtitles(edl: dict, edit_dir: Path) -> bool:
-    if not edl.get("subtitles"):
-        return False
-    srt = edit_dir / "master.srt"
-    edl_path = edit_dir / "edl.json"
-    if not srt.exists():
-        return True
-    return srt.stat().st_mtime < edl_path.stat().st_mtime
-```
-
-- [ ] **Step 4: Run tests**
-
-Run: `pytest tests/test_jobs.py tests/test_api.py tests/test_edl.py -v`
-
-Expected: PASS
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_assemble.py -v`
+Expected: PASS, 8 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/server/jobs.py app/server/main.py tests/test_jobs.py tests/test_api.py
-git commit -m "feat: approve writes EDL then API renders preview"
+git add backend/plan/assemble.py backend/tests/test_assemble.py
+git commit -m "feat: assemble EDL v2 from project state and cuts"
 ```
 
 ---

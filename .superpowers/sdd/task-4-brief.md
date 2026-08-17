@@ -1,194 +1,291 @@
-### Task 4: session file + dead-pid reclaim
+### Task 4: Move export onto the queue
 
 **Files:**
-- Create: `app/__init__.py` (empty)
-- Create: `app/server/__init__.py` (empty)
-- Create: `app/server/paths.py`
-- Create: `app/server/session.py`
-- Create: `tests/test_session.py`
+- Create: `backend/handlers/export.py`
+- Modify: `backend/worker.py:_register_handlers`
+- Modify: `backend/server.py:385-459` (`start_export` enqueues; delete `_run_export`)
+- Modify: `backend/server.py` (add `POST /api/jobs/{jid}/cancel`, `GET /api/jobs/{jid}`)
+- Create: `backend/tests/test_handler_export.py`
 
 **Interfaces:**
-- Consumes: nothing
-- Produces:
+- Consumes: `Ctx` from Task 2; `render_engine.render_export`, `cloudinary_svc.enabled`, `cloudinary_svc.upload_reel`, `compute_cut_state` (all existing).
+- Produces: `handlers.export.run(ctx) -> dict` under kind `"export"`. Reads `ctx.payload` keys `caption_style` and `reel`. Writes the project's `export` sub-document exactly as `_run_export` did today, so the frontend needs no change.
+
+This task deliberately keeps `render_engine.render_export` as the renderer. Swapping
+renderers happens in Task 12, after the EDL model exists. One behaviour change at a
+time.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `backend/tests/test_handler_export.py`:
 
 ```python
-# app/server/paths.py
-REPO_ROOT: Path   # parents[2] from this file
-HELPERS: Path     # REPO_ROOT / "helpers"
-APP_HOME: Path    # Path.home() / ".video-use"
+import os
+import sys
 
-# app/server/session.py
-JOB_KINDS = ("idle", "transcribe", "claude", "render")
+import pytest
+from pymongo import MongoClient
 
-def default_session(folder: Path) -> dict
-def session_path(folder: Path) -> Path   # folder / "edit" / "app_session.json"
-def load_session(folder: Path) -> dict
-def save_session(folder: Path, data: dict) -> None
-def pid_alive(pid: int | None) -> bool
-def reclaim_job(data: dict) -> dict
-# reclaim: if job.kind != idle and job.pid set and not pid_alive, set
-#   data["job"] = {kind: "idle", pid: None, started_at: None, output: None, log: None}
-#   data["last_error"] = "previous {old_kind} job died (pid {pid})"
-```
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-`default_session` shape:
+import jobs as jobs_mod
+import worker as worker_mod
+import handlers.export as eh
 
-```python
-{
-  "claude_session_id": None,
-  "folder": str(folder.resolve()),
-  "edl_approved_at": None,
-  "edl_mtime_at_approve": 0,
-  "last_error": None,
-  "job": {"kind": "idle", "pid": None, "started_at": None, "output": None, "log": None},
+REEL = {
+    "aspect": "9:16", "cinematic": True, "karaoke": True, "zoom_intensity": 1.0,
+    "punch_ins": True, "punch_sensitivity": 0.5, "burn_captions": True,
 }
-```
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_session.py`:
-
-```python
-from __future__ import annotations
-
-from pathlib import Path
-
-from app.server.session import default_session, load_session, pid_alive, reclaim_job, save_session
 
 
-def test_roundtrip(tmp_path: Path):
-    data = default_session(tmp_path)
-    save_session(tmp_path, data)
-    loaded = load_session(tmp_path)
-    assert loaded["folder"] == str(tmp_path.resolve())
-    assert loaded["job"]["kind"] == "idle"
-    assert (tmp_path / "edit" / "app_session.json").exists()
+@pytest.fixture
+def db():
+    client = MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+    name = "clipcut_test"
+    client.drop_database(name)
+    yield client[name]
+    client.drop_database(name)
 
 
-def test_reclaim_dead_pid():
-    data = default_session(Path("C:/footage"))
-    data["job"] = {"kind": "render", "pid": 99999999, "started_at": "t", "output": "x", "log": "y"}
-    out = reclaim_job(data)
-    assert out["job"]["kind"] == "idle"
-    assert out["job"]["pid"] is None
-    assert "render" in (out.get("last_error") or "")
+def _project(db, pid="p1"):
+    db.projects.insert_one({
+        "id": pid, "status": "ready", "video_path": "/tmp/source.mp4",
+        "duration": 10.0, "width": 1080, "height": 1920,
+        "words": [{"text": "hi", "start": 0.0, "end": 0.4, "type": "word"}],
+        "cut_settings": {"pause_threshold": 0.8, "remove_fillers": True, "disabled": []},
+        "reel_settings": dict(REEL), "caption_style": "bold",
+        "export": {"status": "idle", "progress": 0, "error": None},
+    })
 
 
-def test_reclaim_keeps_live_pid():
-    import os
-    data = default_session(Path("C:/footage"))
-    data["job"] = {"kind": "transcribe", "pid": os.getpid(), "started_at": "t", "output": None, "log": None}
-    out = reclaim_job(data)
-    assert out["job"]["kind"] == "transcribe"
-    assert out["job"]["pid"] == os.getpid()
+def test_export_writes_done_state(db, monkeypatch, tmp_path):
+    _project(db)
+    out = tmp_path / "export.mp4"
+    out.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+    monkeypatch.setattr(
+        eh.render_engine, "render_export",
+        lambda **kw: {"width": 1080, "height": 1920, "duration": 9.0},
+    )
+    monkeypatch.setattr(eh.cloudinary_svc, "enabled", lambda: False)
+
+    jobs_mod.enqueue(db, "p1", "export",
+                     {"caption_style": "neon", "reel": dict(REEL)})
+    worker_mod.run_once(db, "w1")
+
+    exp = db.projects.find_one({"id": "p1"})["export"]
+    assert exp["status"] == "done"
+    assert exp["progress"] == 100
+    assert exp["size"] == len(b"video-bytes")
 
 
-def test_pid_alive_false_for_none():
-    assert pid_alive(None) is False
+def test_export_failure_records_error_not_stuck_processing(db, monkeypatch, tmp_path):
+    _project(db, "p2")
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+
+    def boom(**kw):
+        raise RuntimeError("ffmpeg exited 1")
+
+    monkeypatch.setattr(eh.render_engine, "render_export", boom)
+    jobs_mod.enqueue(db, "p2", "export",
+                     {"caption_style": "bold", "reel": dict(REEL)})
+    worker_mod.run_once(db, "w1")
+
+    exp = db.projects.find_one({"id": "p2"})["export"]
+    assert exp["status"] == "error"
+    assert "ffmpeg" in exp["error"]
+
+
+def test_export_honours_cancellation_before_render(db, monkeypatch, tmp_path):
+    _project(db, "p3")
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+    called = {"n": 0}
+
+    def counting(**kw):
+        called["n"] += 1
+        return {}
+
+    monkeypatch.setattr(eh.render_engine, "render_export", counting)
+    jid = jobs_mod.enqueue(db, "p3", "export",
+                           {"caption_style": "bold", "reel": dict(REEL)})
+    jobs_mod.request_cancel(db, jid)
+    worker_mod.run_once(db, "w1")
+
+    assert called["n"] == 0
+    assert db.jobs.find_one({"id": jid})["status"] == "cancelled"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_session.py -v`
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_handler_export.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'handlers.export'`
 
-Expected: FAIL with import error for `app.server.session`
+- [ ] **Step 3: Write minimal implementation**
 
-- [ ] **Step 3: Implement paths + session**
-
-`app/__init__.py` and `app/server/__init__.py`: empty files.
-
-`app/server/paths.py`:
+Create `backend/handlers/export.py`:
 
 ```python
-from __future__ import annotations
+"""Export job: cut, caption, master, optionally push to Cloudinary."""
 
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-HELPERS = REPO_ROOT / "helpers"
-APP_HOME = Path.home() / ".video-use"
-```
+import cloudinary_svc
+import render_engine
+import worker
+from worker import Cancelled
 
-`app/server/session.py`:
-
-```python
-from __future__ import annotations
-
-import json
-import os
-from pathlib import Path
-
-JOB_KINDS = ("idle", "transcribe", "claude", "render")
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
 
 
-def default_session(folder: Path) -> dict:
-    return {
-        "claude_session_id": None,
-        "folder": str(folder.resolve()),
-        "edl_approved_at": None,
-        "edl_mtime_at_approve": 0,
-        "last_error": None,
-        "job": {"kind": "idle", "pid": None, "started_at": None, "output": None, "log": None},
-    }
+def project_dir(pid: str) -> Path:
+    return DATA_DIR / pid
 
 
-def session_path(folder: Path) -> Path:
-    return folder / "edit" / "app_session.json"
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def load_session(folder: Path) -> dict:
-    path = session_path(folder)
-    if not path.exists():
-        return default_session(folder)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    base = default_session(folder)
-    base.update(data)
-    if not isinstance(base.get("job"), dict):
-        base["job"] = default_session(folder)["job"]
-    return reclaim_job(base)
+def run(ctx) -> dict:
+    from server import compute_cut_state  # imported lazily; server owns cut math
 
+    doc = ctx.db.projects.find_one({"id": ctx.project_id})
+    if not doc:
+        raise RuntimeError(f"project {ctx.project_id} not found")
 
-def save_session(folder: Path, data: dict) -> None:
-    path = session_path(folder)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    style_key = ctx.payload["caption_style"]
+    reel = ctx.payload["reel"]
+    pdir = project_dir(ctx.project_id)
+    out_path = pdir / "export.mp4"
 
+    if ctx.cancelled():
+        raise Cancelled()
 
-def pid_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
+    def cb(p):
+        stage = "cutting" if p < 68 else ("captioning" if p < 90 else "mastering")
+        ctx.progress(p, stage)
+        ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+            "export.progress": p, "export.stage": stage,
+        }})
+
     try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        state = compute_cut_state({**doc, "reel_settings": reel})
+        meta = render_engine.render_export(
+            source=Path(doc["video_path"]),
+            words=doc.get("words") or [],
+            ranges=state["keep_ranges"],
+            style_key=style_key,
+            burn=reel["burn_captions"],
+            work_dir=pdir / "work",
+            out_path=out_path,
+            aspect=reel["aspect"],
+            cinematic=reel["cinematic"],
+            karaoke=reel["karaoke"],
+            zoom_intensity=reel["zoom_intensity"],
+            punch_ins=reel.get("punch_ins", True),
+            punch_sensitivity=reel.get("punch_sensitivity", 0.5),
+            progress_cb=cb,
+        )
+    except Exception as e:
+        ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+            "export": {"status": "error", "progress": 0,
+                       "error": str(e)[:500], "stage": "failed"},
+        }})
+        raise
+
+    cloud = {}
+    if cloudinary_svc.enabled():
+        try:
+            cloud = cloudinary_svc.upload_reel(
+                out_path, public_id=f"reel_{ctx.project_id}",
+                reframe=reel["aspect"] == "9:16",
+            )
+        except Exception as e:
+            cloud = {"error": str(e)[:300]}
+
+    ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+        "export": {
+            "status": "done", "progress": 100, "error": None, "stage": "done",
+            "path": str(out_path), "meta": meta,
+            "size": out_path.stat().st_size,
+            "finished_at": _now_iso(),
+        },
+        "cloud": cloud,
+    }})
+    shutil.rmtree(pdir / "work", ignore_errors=True)
+    return {"path": str(out_path)}
 
 
-def reclaim_job(data: dict) -> dict:
-    job = data.get("job") or {}
-    kind = job.get("kind") or "idle"
-    pid = job.get("pid")
-    if kind != "idle" and pid and not pid_alive(int(pid)):
-        data["last_error"] = f"previous {kind} job died (pid {pid})"
-        data["job"] = {"kind": "idle", "pid": None, "started_at": None, "output": None, "log": None}
-    return data
+worker.HANDLERS["export"] = run
 ```
 
-On Windows `os.kill(pid, 0)` works for a same-user process check. `PermissionError` means the pid exists; `OSError` / `ProcessLookupError` means it does not.
+Modify `backend/worker.py:_register_handlers`:
 
-- [ ] **Step 4: Run tests**
+```python
+def _register_handlers() -> None:
+    import handlers.transcribe  # noqa: F401
+    import handlers.export      # noqa: F401
+```
 
-Run: `pytest tests/test_session.py -v`
+Modify `backend/server.py` — replace the body of `start_export` after validation:
 
-Expected: PASS
+```python
+    projects.update_one({"id": pid}, {"$set": {
+        "caption_style": body.caption_style,
+        "reel_settings": reel,
+        "export": {"status": "processing", "progress": 0, "error": None, "stage": "cutting"},
+    }})
+    jid = jobs.enqueue(db, pid, "export",
+                       {"caption_style": body.caption_style, "reel": reel})
+    return {"ok": True, "reel_settings": reel, "job_id": jid}
+```
 
-- [ ] **Step 5: Commit**
+Delete `_run_export` entirely. Add two routes near the other `@api` routes:
+
+```python
+@api.get("/jobs/{jid}")
+def get_job(jid: str):
+    doc = db.jobs.find_one({"id": jid}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "job not found")
+    return doc
+
+
+@api.post("/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    if not db.jobs.find_one({"id": jid}, {"_id": 1}):
+        raise HTTPException(404, "job not found")
+    jobs.request_cancel(db, jid)
+    return {"ok": True}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_handler_export.py -v`
+Expected: PASS, 3 passed
+
+- [ ] **Step 5: Verify no threads remain**
+
+Run: `cd backend && grep -n "threading" server.py`
+Expected: no matches. Remove the now-unused `import threading`.
+
+- [ ] **Step 6: Manual end-to-end check**
+
+Start the worker in one terminal and the API in another, then upload a clip
+through the UI and export it. Confirm the export completes and the file plays.
 
 ```bash
-git add app/__init__.py app/server/__init__.py app/server/paths.py app/server/session.py tests/test_session.py
-git commit -m "feat: persist edit/app_session.json and reclaim dead jobs"
+cd backend && ../.venv-local/Scripts/python.exe worker.py
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/handlers/export.py backend/worker.py backend/server.py backend/tests/test_handler_export.py
+git commit -m "feat: run export as a cancellable queued job"
 ```
 
 ---

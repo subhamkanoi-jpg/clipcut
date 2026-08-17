@@ -1,61 +1,99 @@
-### Task 13: installer docs + dev launcher
+### Task 13: Dev script for the three processes
 
 **Files:**
-- Modify: `install.md`
-- Create: `app/scripts/dev.ps1`
-- Modify: `README.md` (short “Local app (Windows)” paragraph pointing at `install.md` and `app/scripts/dev.ps1`)
+- Create: `scripts/dev.ps1`
+- Modify: `README.md` (add a ClipCut section)
 
 **Interfaces:**
-- Consumes: ports and extras from the spec
-- Produces: one command that starts both processes
+- Consumes: nothing.
+- Produces: a single command that starts API, worker, and frontend.
 
-- [ ] **Step 1: Write `app/scripts/dev.ps1`**
+- [ ] **Step 1: Write the script**
+
+Create `scripts/dev.ps1`:
 
 ```powershell
+# Start ClipCut: API, worker, and frontend.
 $ErrorActionPreference = "Stop"
-$root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-Set-Location $root
+$root = Split-Path -Parent $PSScriptRoot
+$py = Join-Path $root ".venv-local\Scripts\python.exe"
 
-Start-Process -NoNewWindow -FilePath "python" -ArgumentList "-m", "uvicorn", "app.server.main:app", "--host", "127.0.0.1", "--port", "8787", "--reload"
-Set-Location (Join-Path $root "app\web")
-if (-not (Test-Path "node_modules")) { npm install }
-npm run dev
+if (-not (Test-Path $py)) { throw "venv missing at $py" }
+
+$svc = Get-Service -Name MongoDB -ErrorAction SilentlyContinue
+if ($null -eq $svc -or $svc.Status -ne "Running") {
+    throw "MongoDB service is not running. Start it, then retry."
+}
+
+Start-Process -FilePath $py -ArgumentList "-m","uvicorn","server:app","--port","8000" `
+              -WorkingDirectory (Join-Path $root "backend")
+Start-Process -FilePath $py -ArgumentList "worker.py" `
+              -WorkingDirectory (Join-Path $root "backend")
+Start-Process -FilePath "npm" -ArgumentList "start" `
+              -WorkingDirectory (Join-Path $root "frontend")
+
+Write-Output "API      http://localhost:8000"
+Write-Output "Frontend http://localhost:3000"
+Write-Output "Worker   running (check its window for job logs)"
 ```
 
-- [ ] **Step 2: Add a Windows section to `install.md` after the macOS brew block**
+- [ ] **Step 2: Run it**
+
+Run: `powershell -ExecutionPolicy Bypass -File scripts\dev.ps1`
+Expected: three windows open; `curl http://localhost:8000/api/` returns
+`{"status":"ok"}`.
+
+- [ ] **Step 3: Document it**
+
+Add to `README.md` after the "Local app (Windows)" section:
 
 ```markdown
-### Windows
+### ClipCut (web reel editor)
+
+ClipCut is the browser-based reel editor in `backend/` + `frontend/`. It needs
+MongoDB running locally and an ElevenLabs key in `backend/.env`.
 
 ```powershell
-# ffmpeg full build (has libass / subtitles)
-winget install Gyan.FFmpeg
-
-# Python extras for the local app
-cd $HOME\Developer\video-use
-pip install -e ".[app,dev]"
-
-# Skill junction (already present on this machine; recreate if needed)
-New-Item -ItemType Junction -Path "$HOME\.claude\skills\video-use" -Target "$HOME\Developer\video-use" -Force
-
-# Launch the local app
-powershell -File app\scripts\dev.ps1
-# UI: http://localhost:5173   API: http://127.0.0.1:8787
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
 ```
 
-Do not use `brew`. Do not run Scribe as part of install.
+This starts three processes: the API on :8000, the job worker, and the frontend
+on :3000. The worker runs all transcription and rendering; the API only enqueues.
+
+Backend dependencies are the eight packages the code actually imports — do not
+install `backend/requirements.txt`, which is a stale Emergent lockfile pinning a
+private wheel.
 ```
-
-- [ ] **Step 3: README paragraph**
-
-Under Manual install, add 4 lines: Windows users can run the local app via `app/scripts/dev.ps1` after `pip install -e ".[app]"`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add install.md README.md app/scripts/dev.ps1
-git commit -m "docs: Windows install and local app launcher"
+git add scripts/dev.ps1 README.md
+git commit -m "docs: add ClipCut dev script and README section"
 ```
 
 ---
 
+## Self-Review
+
+**Spec coverage.** Every spec section for steps 1-3 maps to a task: job queue
+(Tasks 1-2), transcription and export migration (3-4), EDL v2 (5), materialize
+(6), renderer convergence (7-9, 11-12), assembly (10), operations (13). The
+`GET /api/jobs/{jid}` and cancel routes land in Task 4. Deferred to plan 2, as
+the spec states: decision providers, `POST /api/projects/{pid}/plan`, the
+overlay PATCH route, plan-review UI, and b-roll.
+
+**Known gaps carried into plan 2.** `plan.assemble.from_project` always emits
+empty `overlays`, and `render_plan._composite` filters on `enabled` but has
+nothing to filter yet. Both are intentional: the schema and the code path exist
+so plan 2 adds data, not structure.
+
+**Type consistency.** `Ctx.progress(p, stage)` is two-positional throughout;
+Task 4's initial `cb(p)` is explicitly widened to `cb(p, stage)` in Task 12
+Step 4 when the renderer changes. `model.validate` returns `list[str]`
+everywhere. `cover_crop_filter` is used only by `extract_segment`. `CAPTION_STYLES`
+moves from `render_engine` to `captions_ass` in Task 8 and every later reference
+uses the new home.
+
+**Risk.** Task 12 is the only destructive task and is gated on Task 12 Step 3
+passing. If parity fails, stop and reconcile rather than deleting.

@@ -1,121 +1,99 @@
-### Task 1: UTF-8 stdio + pytest harness
+### Task 1: EDL v2 validation accepts the v1-compat shape
 
 **Files:**
-- Create: `helpers/stdio.py`
-- Create: `tests/conftest.py`
-- Create: `tests/test_stdio.py`
-- Modify: `pyproject.toml`
-- Modify: `helpers/render.py` (top of `main()`)
-- Modify: `helpers/grade.py` (top of `main()`)
-- Modify: `helpers/pack_transcripts.py` (top of `main()`)
-- Modify: `helpers/transcribe.py` (top of `main()`)
-- Modify: `helpers/transcribe_batch.py` (top of `main()`)
+- Modify: `backend/plan/model.py` (the `validate` function)
+- Test: `backend/tests/test_plan_model.py`
 
 **Interfaces:**
-- Consumes: nothing
-- Produces: `configure_stdio() -> None` in `helpers/stdio.py`
+- Consumes: nothing new.
+- Produces: `validate(plan)` accepts `version` 1 or 2, and `reframe.center_x` as either a scalar in `[0,1]` or a keyframe list `[{"t": float, "cx": float}, ...]`.
 
-- [ ] **Step 1: Add pytest extra**
+This closes the whole-branch review's plan-2 carry-forward: the spec requires
+"EDL v2 validation including the v1-compatibility path", and readers must accept
+both the scalar `center_x` and a future keyframe track.
 
-In `pyproject.toml`, replace the optional-deps block with:
+- [ ] **Step 1: Write the failing tests**
 
-```toml
-[project.optional-dependencies]
-animations = ["manim"]
-app = ["fastapi>=0.115", "uvicorn[standard]>=0.32", "pydantic>=2.0"]
-dev = ["pytest>=8.0"]
-```
-
-- [ ] **Step 2: Write the failing test**
-
-`tests/conftest.py`:
+Append to `backend/tests/test_plan_model.py`:
 
 ```python
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-import pytest
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-HELPERS = REPO_ROOT / "helpers"
+def test_validate_accepts_version_1():
+    p = model.new_plan("p1", "s.mp4")
+    p["version"] = 1
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert model.validate(p) == []
 
 
-@pytest.fixture(autouse=True)
-def helpers_on_path():
-    for p in (str(REPO_ROOT), str(HELPERS)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    yield
+def test_validate_accepts_center_x_keyframe_list():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["center_x"] = [{"t": 0.0, "cx": 0.4}, {"t": 1.5, "cx": 0.6}]
+    assert model.validate(p) == []
+
+
+def test_validate_rejects_keyframe_with_bad_cx():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["center_x"] = [{"t": 0.0, "cx": 1.9}]
+    assert any("center_x" in e for e in model.validate(p))
+
+
+def test_validate_still_rejects_version_3():
+    p = model.new_plan("p1", "s.mp4")
+    p["version"] = 3
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert any("version" in e for e in model.validate(p))
 ```
 
-`tests/test_stdio.py`:
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_plan_model.py -v`
+Expected: the four new tests FAIL (version-1 rejected; keyframe list rejected as non-numeric center_x).
+
+- [ ] **Step 3: Implement**
+
+In `backend/plan/model.py`, replace the version check and the `center_x` check in `validate`:
 
 ```python
-from __future__ import annotations
-
-import io
-import sys
-
-from stdio import configure_stdio
-
-
-def test_configure_stdio_allows_arrows_on_cp1252(monkeypatch):
-    buf = io.BytesIO()
-    fake = io.TextIOWrapper(buf, encoding="cp1252", errors="strict", write_through=True)
-    monkeypatch.setattr(sys, "stdout", fake)
-    configure_stdio()
-    print("extracting 1 segment(s) → clips/")
-    fake.flush()
-    assert "→" in buf.getvalue().decode("utf-8")
+    if plan.get("version") not in (1, PLAN_VERSION):
+        errors.append(f"version must be 1 or {PLAN_VERSION}, got {plan.get('version')!r}")
 ```
-
-- [ ] **Step 3: Run test to verify it fails**
-
-Run: `pip install -e ".[dev]"` then `pytest tests/test_stdio.py -v`
-
-Expected: FAIL with `ModuleNotFoundError: No module named 'stdio'`
-
-- [ ] **Step 4: Implement `configure_stdio` and call it from every helper `main()`**
-
-`helpers/stdio.py`:
 
 ```python
-"""Make helper prints safe on non-UTF-8 stdout (Windows cp1252)."""
-
-from __future__ import annotations
-
-import sys
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            reconfigure(encoding="utf-8", errors="replace")
+    cx = reframe.get("center_x", 0.5)
+    if isinstance(cx, list):
+        for j, kf in enumerate(cx):
+            if not isinstance(kf, dict):
+                errors.append(f"reframe.center_x[{j}] must be an object")
+                continue
+            try:
+                t = float(kf["t"])
+                c = float(kf["cx"])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"reframe.center_x[{j}] needs numeric t and cx")
+                continue
+            if t < 0:
+                errors.append(f"reframe.center_x[{j}].t must be >= 0")
+            if not 0.0 <= c <= 1.0:
+                errors.append(f"reframe.center_x[{j}].cx must be in [0, 1], got {c}")
+    else:
+        try:
+            if not 0.0 <= float(cx) <= 1.0:
+                errors.append(f"reframe.center_x must be in [0, 1], got {cx}")
+        except (TypeError, ValueError):
+            errors.append(f"reframe.center_x must be numeric, got {cx!r}")
 ```
 
-At the first line of `main()` in `render.py`, `grade.py`, `pack_transcripts.py`, `transcribe.py`, `transcribe_batch.py`:
+- [ ] **Step 4: Run to verify pass**
 
-```python
-    from stdio import configure_stdio
-    configure_stdio()
-```
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_plan_model.py -v`
+Expected: PASS (all, including the pre-existing ones).
 
-Use a local import so running a helper as a script still works (`helpers/` is on `sys.path[0]`).
-
-- [ ] **Step 5: Run tests**
-
-Run: `pytest tests/test_stdio.py -v`
-
-Expected: PASS
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add pyproject.toml helpers/stdio.py helpers/render.py helpers/grade.py helpers/pack_transcripts.py helpers/transcribe.py helpers/transcribe_batch.py tests/conftest.py tests/test_stdio.py
-git commit -m "fix: utf-8 helper stdout on Windows"
+git add backend/plan/model.py backend/tests/test_plan_model.py
+git commit -m "feat: EDL v2 validation accepts v1 version and center_x keyframes"
 ```
 
 ---

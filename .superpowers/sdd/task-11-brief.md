@@ -1,127 +1,228 @@
-### Task 11: Vite UI — layout + state rendering
+### Task 11: Render an EDL v2 through the helpers pipeline
 
 **Files:**
-- Create: `app/web/package.json`, `app/web/vite.config.ts`, `app/web/tsconfig.json`, `app/web/index.html`
-- Create: `app/web/src/main.tsx`, `app/web/src/App.tsx`, `app/web/src/api.ts`, `app/web/src/types.ts`, `app/web/src/App.css`
-- Create: `app/web/src/centerState.test.ts`
-- Create: `app/web/vitest.config.ts`
+- Create: `backend/plan/render_plan.py`
+- Create: `backend/tests/test_render_plan.py`
 
 **Interfaces:**
-- Consumes: `GET /api/state` payload from Task 7 (same field names)
-- Produces: a three-column page that renders `center_state` and never calls ffmpeg/claude
+- Consumes: `plan.model.validate` (Task 5), `plan.materialize.write` (Task 6), `helpers.render.extract_segment`/`concat_segments`/`build_final_composite`/`apply_loudnorm_two_pass`, `helpers.captions_ass.build_ass` (Task 8).
+- Produces: `plan.render_plan.render(plan: dict, project_dir: Path, out_path: Path, words: list, progress_cb=None, cancel_cb=None) -> dict` returning `{"width", "height", "duration"}`. Raises `ValueError` listing plan errors when validation fails. Calls `cancel_cb()` before each ffmpeg spawn and raises `worker.Cancelled` when it returns True.
 
-`app/web/src/api.ts`:
+- [ ] **Step 1: Write the failing test**
 
-```typescript
-export const API = "http://127.0.0.1:8787";
+Create `backend/tests/test_render_plan.py`:
 
-export async function getState() {
-  const r = await fetch(`${API}/api/state`);
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
+```python
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
+
+from plan import model, render_plan
+
+
+def _plan(tmp_path):
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"x")
+    p = model.new_plan("p1", str(src))
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0, "zoom": 1.0}]
+    p["total_duration_s"] = 2.0
+    return p
+
+
+def test_invalid_plan_raises_with_reasons(tmp_path):
+    p = _plan(tmp_path)
+    p["ranges"] = []
+    with pytest.raises(ValueError) as exc:
+        render_plan.render(p, tmp_path, tmp_path / "out.mp4", words=[])
+    assert "ranges" in str(exc.value)
+
+
+def test_progress_callback_reports_named_stages(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(render_plan, "_extract_all", lambda *a, **k: [tmp_path / "s0.mp4"])
+    monkeypatch.setattr(render_plan, "_concat", lambda *a, **k: tmp_path / "base.mp4")
+    monkeypatch.setattr(render_plan, "_composite", lambda *a, **k: tmp_path / "comp.mp4")
+    monkeypatch.setattr(render_plan, "_master", lambda *a, **k: None)
+    monkeypatch.setattr(render_plan, "_probe_out",
+                        lambda p: {"width": 1080, "height": 1920, "duration": 2.0})
+
+    render_plan.render(_plan(tmp_path), tmp_path, tmp_path / "out.mp4",
+                       words=[], progress_cb=lambda p, s: seen.append(s))
+
+    assert [s for s in ("cutting", "compositing", "captioning", "mastering")
+            if s in seen] == ["cutting", "compositing", "captioning", "mastering"]
+
+
+def test_cancel_before_extract_raises(tmp_path, monkeypatch):
+    import worker
+
+    monkeypatch.setattr(render_plan, "_extract_all",
+                        lambda *a, **k: pytest.fail("must not extract"))
+    with pytest.raises(worker.Cancelled):
+        render_plan.render(_plan(tmp_path), tmp_path, tmp_path / "out.mp4",
+                           words=[], cancel_cb=lambda: True)
 ```
 
-`vite.config.ts` does not need a proxy if `API` is absolute and CORS is on. Keep it simple.
+- [ ] **Step 2: Run test to verify it fails**
 
-`app/web/src/centerState.test.ts` (vitest):
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_render_plan.py -v`
+Expected: FAIL — `ImportError: cannot import name 'render_plan'`
 
-```typescript
-import { describe, it, expect } from "vitest";
-import { canChat, canTranscribe, canApprove, canRenderFinal } from "./buttons";
+- [ ] **Step 3: Write minimal implementation**
 
-describe("buttons", () => {
-  it("empty disables chat and approve", () => {
-    expect(canChat("empty", true)).toBe(false);
-    expect(canApprove("empty", true)).toBe(false);
-    expect(canRenderFinal("preview-ready")).toBe(true);
-    expect(canRenderFinal("packed")).toBe(false);
-  });
-  it("packed enables chat and approve when doctor ok", () => {
-    expect(canChat("packed", true)).toBe(true);
-    expect(canChat("packed", false)).toBe(false);
-    expect(canApprove("packed", true)).toBe(true);
-    expect(canApprove("stale", true)).toBe(true);
-    expect(canApprove("strategy-ready", true)).toBe(true);
-    expect(canApprove("inventory", true)).toBe(false);
-  });
-});
+Create `backend/plan/render_plan.py`:
+
+```python
+"""Render an EDL v2 using the helpers/ pipeline.
+
+Stage order is fixed: cut -> concat -> composite overlays -> burn captions ->
+two-pass loudnorm. Captions are always last before mastering so overlays cannot
+cover them.
+"""
+
+import json
+import subprocess
+from pathlib import Path
+
+import captions_ass
+import render as helpers_render
+import worker
+from plan import materialize, model
+
+
+def _probe_out(path: Path) -> dict:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-show_entries", "format=duration",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(out.stdout)
+    stream = (data.get("streams") or [{}])[0]
+    return {
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "duration": float((data.get("format") or {}).get("duration") or 0.0),
+    }
+
+
+def _extract_all(plan, project_dir, work_dir, cover, center_x):
+    sources = plan["sources"]
+    paths = []
+    for i, r in enumerate(plan["ranges"]):
+        seg = work_dir / f"seg_{i:04d}.mp4"
+        helpers_render.extract_segment(
+            Path(sources[r["source"]]),
+            float(r["start"]),
+            float(r["end"]) - float(r["start"]),
+            helpers_render.resolve_grade_filter(plan.get("grade")),
+            seg,
+            zoom=float(r.get("zoom") or 1.0),
+            cover=cover,
+            center_x=center_x,
+        )
+        paths.append(seg)
+    return paths
+
+
+def _concat(paths, work_dir, edit_dir):
+    base = work_dir / "base.mp4"
+    helpers_render.concat_segments(paths, base, edit_dir)
+    return base
+
+
+def _composite(base, plan, subs_path, work_dir, edit_dir):
+    out = work_dir / "composite.mp4"
+    overlays = [o for o in (plan.get("overlays") or []) if o.get("enabled")]
+    helpers_render.build_final_composite(base, overlays, subs_path, out, edit_dir)
+    return out
+
+
+def _master(src, out_path):
+    helpers_render.apply_loudnorm_two_pass(src, out_path)
+
+
+def render(plan: dict, project_dir: Path, out_path: Path, words: list,
+           progress_cb=None, cancel_cb=None) -> dict:
+    errors = model.validate(plan)
+    if errors:
+        raise ValueError("invalid plan: " + "; ".join(errors))
+
+    def tick(p, stage):
+        if progress_cb:
+            progress_cb(p, stage)
+
+    def check_cancel():
+        if cancel_cb and cancel_cb():
+            raise worker.Cancelled()
+
+    project_dir = Path(project_dir)
+    edit_dir = materialize.edit_dir(project_dir)
+    work_dir = edit_dir / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    materialize.write(plan, project_dir)
+
+    aspect = (plan.get("reframe") or {}).get("aspect", "9:16")
+    cover = aspect == "9:16"
+    center_x = float((plan.get("reframe") or {}).get("center_x", 0.5))
+
+    check_cancel()
+    tick(10, "cutting")
+    segments = _extract_all(plan, project_dir, work_dir, cover, center_x)
+
+    check_cancel()
+    tick(55, "compositing")
+    base = _concat(segments, work_dir, edit_dir)
+
+    subs_path = None
+    caps = plan.get("captions") or {}
+    if caps.get("burn") and words:
+        check_cancel()
+        tick(70, "captioning")
+        probe = _probe_out(base)
+        subs_path = edit_dir / "captions.ass"
+        style = captions_ass.CAPTION_STYLES.get(
+            caps.get("style", "bold"), captions_ass.CAPTION_STYLES["bold"]
+        )
+        captions_ass.build_ass(
+            words,
+            # captions_ass.timeline_chunks unpacks `for r_start, r_end in ranges`,
+            # so these must be (start, end) TUPLES, not dicts. EDL v2 ranges are
+            # dicts, so convert here.
+            [(r["start"], r["end"]) for r in plan["ranges"]],
+            subs_path, style, probe["width"], probe["height"],
+            karaoke=bool(caps.get("karaoke", True)),
+            fonts_dir=captions_ass.FONTS_DIR,
+        )
+    else:
+        tick(70, "captioning")
+
+    composited = _composite(base, plan, subs_path, work_dir, edit_dir)
+
+    check_cancel()
+    tick(90, "mastering")
+    _master(composited, out_path)
+
+    tick(100, "done")
+    return _probe_out(out_path)
 ```
 
-`app/web/src/buttons.ts`:
+- [ ] **Step 4: Run test to verify it passes**
 
-```typescript
-export function canChat(state: string, doctorOk: boolean) {
-  return doctorOk && !["empty", "inventory", "transcribing"].includes(state);
-}
-export function canTranscribe(state: string, doctorOk: boolean) {
-  return doctorOk && ["inventory", "packed", "error"].includes(state);
-}
-export function canApprove(state: string, doctorOk: boolean) {
-  return doctorOk && ["packed", "strategy-ready", "stale", "preview-ready", "error"].includes(state);
-}
-export function canRenderFinal(state: string) {
-  return state === "preview-ready";
-}
-```
-
-- [ ] **Step 1: Scaffold Vite React TS in `app/web`**
-
-Run from repo root:
-
-```powershell
-cd app
-npm create vite@latest web -- --template react-ts
-cd web
-npm install
-npm install -D vitest
-```
-
-If `app/web` already exists, do not re-scaffold; add missing files only.
-
-Set `app/web/vite.config.ts`:
-
-```ts
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-
-export default defineConfig({
-  plugins: [react()],
-  server: { port: 5173, strictPort: true },
-});
-```
-
-Add to `app/web/package.json` scripts: `"test": "vitest run"`.
-
-- [ ] **Step 2: Write the failing button tests, then `buttons.ts`**
-
-Create `app/web/src/buttons.ts` and `app/web/src/centerState.test.ts` with the **correct** rules in Interfaces (not the contradictory draft). Run `npm test` in `app/web` — first without `buttons.ts` to see FAIL, then implement.
-
-- [ ] **Step 3: Build the three-column `App.tsx`**
-
-Left: doctor strip (green/red per check name, never print secrets), path input, Browse (`POST /api/folder/browse` then refresh state), recents list, source list (`name`, `duration_s`, `width`×`height`, `fps`), Open edit (`POST /api/open-edit`).
-
-Center: state label, `error` text, packed transcript `<pre>`, ranges list from `edl.ranges`, `<video src={`${API}/api/media/preview`} controls />` if `has_preview` else first source via `/api/media/source/{name}`, buttons Transcribe / Approve & preview / Render final / Reject (prompt for a note → `POST /api/reject`). Disable from `buttons.ts`. Poll `GET /api/state` every 1s while `job.kind !== "idle"`.
-
-Right: chat log, textarea, Send → `POST /api/chat` (Task 12 if stream not wired yet: show “chat not connected” only if the route 404s; prefer wiring a non-stream JSON fallback). For this task, Send may `POST /api/chat` and then poll state. Streaming is Task 12.
-
-Minimal CSS: three equal columns, full viewport, no framework required.
-
-- [ ] **Step 4: Run UI tests**
-
-Run: `cd app/web; npm test`
-
-Expected: PASS
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_render_plan.py -v`
+Expected: PASS, 3 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/web
-git commit -m "feat: three-column local app UI"
+git add backend/plan/render_plan.py backend/tests/test_render_plan.py
+git commit -m "feat: render EDL v2 through the helpers pipeline"
 ```
-
-Do not commit `app/web/node_modules`. Confirm `node_modules/` is gitignored (repo `.gitignore` already has it).
 
 ---
 

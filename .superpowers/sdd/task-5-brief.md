@@ -1,257 +1,222 @@
-### Task 5: inventory + recents + helper subprocess env
+### Task 5: EDL v2 model and validation
 
 **Files:**
-- Create: `app/server/proc.py`
-- Create: `app/server/recents.py`
-- Create: `app/server/inventory.py`
-- Create: `tests/test_inventory.py`
+- Create: `backend/plan/__init__.py`
+- Create: `backend/plan/model.py`
+- Create: `backend/tests/test_plan_model.py`
 
 **Interfaces:**
-- Consumes: `HELPERS`, `APP_HOME` from Task 4
-- Produces:
+- Consumes: nothing.
+- Produces: `plan.model.new_plan(project_id, source_path) -> dict`; `plan.model.validate(plan: dict) -> list[str]` returning error strings (empty list means valid); `plan.model.overlay(kind, start_in_output, duration, **extra) -> dict` factory that assigns an `id`; `plan.model.PLAN_VERSION = 2`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `backend/tests/test_plan_model.py`:
 
 ```python
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".webm", ".avi"}
+import os
+import sys
 
-def helper_env() -> dict   # os.environ + PYTHONIOENCODING=utf-8 + PYTHONUTF8=1
-def find_videos(folder: Path) -> list[Path]
-def probe_source(path: Path, *, run=subprocess.run) -> dict
-# {name, path, duration_s, width, height, fps, error}
-def inventory(folder: Path, *, run=subprocess.run) -> list[dict]
-def add_recent(folder: Path) -> list[str]
-def load_recents() -> list[str]
-```
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-`probe_source` runs:
-
-`ffprobe -v error -show_entries format=duration -show_entries stream=width,height,avg_frame_rate,codec_type -of json <path>`
-
-Parse the first video stream. On failure set `error` to stderr snippet, numeric fields to `None`.
-
-Recents file: `APP_HOME / "recents.json"` — JSON array of absolute paths, most recent first, max 10, de-duplicated.
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_inventory.py`:
-
-```python
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-from app.server.inventory import VIDEO_EXTS, find_videos, probe_source
-from app.server.proc import helper_env
-from app.server.recents import add_recent, load_recents
+from plan import model
 
 
-def test_find_videos_filters(tmp_path: Path):
-    (tmp_path / "a.MP4").write_bytes(b"x")
-    (tmp_path / "b.webm").write_bytes(b"x")
-    (tmp_path / "note.txt").write_bytes(b"x")
-    (tmp_path / "edit").mkdir()
-    names = {p.name for p in find_videos(tmp_path)}
-    assert names == {"a.MP4", "b.webm"}
-    assert ".webm" in VIDEO_EXTS
+def test_new_plan_has_v2_shape():
+    p = model.new_plan("p1", "data/p1/source.mp4")
+    assert p["version"] == 2
+    assert p["project_id"] == "p1"
+    assert p["sources"] == {"main": "data/p1/source.mp4"}
+    assert p["ranges"] == []
+    assert p["overlays"] == []
+    assert p["audio_overlays"] == []
+    assert p["reframe"]["aspect"] == "9:16"
+    assert p["captions"]["karaoke"] is True
 
 
-def test_helper_env_forces_utf8(monkeypatch):
-    monkeypatch.setenv("FOO", "1")
-    env = helper_env()
-    assert env["PYTHONIOENCODING"] == "utf-8"
-    assert env["PYTHONUTF8"] == "1"
-    assert env["FOO"] == "1"
+def test_overlay_factory_assigns_unique_ids():
+    a = model.overlay("broll", 1.0, 2.0, query="laptop")
+    b = model.overlay("broll", 3.0, 2.0, query="desk")
+    assert a["id"] != b["id"]
+    assert a["enabled"] is True
+    assert a["locked"] is False
+    assert a["query"] == "laptop"
 
 
-def test_probe_parses_ffprobe():
-    payload = {
-        "format": {"duration": "12.5"},
-        "streams": [
-            {"codec_type": "audio"},
-            {"codec_type": "video", "width": 1920, "height": 1080, "avg_frame_rate": "30000/1001"},
-        ],
-    }
-    def run(cmd, **kwargs):
-        class R:
-            returncode = 0
-            stdout = json.dumps(payload)
-            stderr = ""
-        return R()
-    info = probe_source(Path("C:/a.mp4"), run=run)
-    assert info["duration_s"] == 12.5
-    assert info["width"] == 1920
-    assert info["height"] == 1080
-    assert info["error"] is None
+def test_validate_accepts_minimal_valid_plan():
+    p = model.new_plan("p1", "data/p1/source.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert model.validate(p) == []
 
 
-def test_recents_cap_and_dedupe(tmp_path, monkeypatch):
-    from app.server import recents as recents_mod
-    monkeypatch.setattr(recents_mod, "RECENTS_PATH", tmp_path / "recents.json")
-    for i in range(12):
-        add_recent(Path(f"C:/f/{i}"))
-    add_recent(Path("C:/f/11"))
-    items = load_recents()
-    assert items[0].endswith("11")
-    assert len(items) == 10
+def test_validate_rejects_empty_ranges():
+    p = model.new_plan("p1", "s.mp4")
+    assert any("ranges" in e for e in model.validate(p))
+
+
+def test_validate_rejects_unknown_source():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "nope", "start": 0.0, "end": 1.0}]
+    assert any("nope" in e for e in model.validate(p))
+
+
+def test_validate_rejects_inverted_range():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 5.0, "end": 5.0}]
+    assert any("start < end" in e for e in model.validate(p))
+
+
+def test_validate_rejects_negative_overlay_duration():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["overlays"] = [model.overlay("broll", 0.5, -1.0)]
+    assert any("duration" in e for e in model.validate(p))
+
+
+def test_validate_rejects_bad_aspect():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["aspect"] = "4:3"
+    assert any("aspect" in e for e in model.validate(p))
+
+
+def test_validate_rejects_center_x_out_of_range():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["center_x"] = 1.7
+    assert any("center_x" in e for e in model.validate(p))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_inventory.py -v`
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_plan_model.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'plan'`
 
-Expected: FAIL with import error
+- [ ] **Step 3: Write minimal implementation**
 
-- [ ] **Step 3: Implement proc, recents, inventory**
-
-`app/server/proc.py`:
+Create `backend/plan/__init__.py`:
 
 ```python
-from __future__ import annotations
-
-import os
-import subprocess
-from pathlib import Path
-
-from app.server.paths import HELPERS
-
-
-def helper_env() -> dict:
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    return env
-
-
-def run_helper(script: str, args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    cmd = ["python", str(HELPERS / script), *args]
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        env=helper_env(),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+"""EDL v2 plan model, assembly, and materialization."""
 ```
 
-`app/server/recents.py`:
+Create `backend/plan/model.py`:
 
 ```python
-from __future__ import annotations
+"""EDL v2: the reviewable edit plan.
 
-import json
-from pathlib import Path
+Extends the video-use EDL v1 (SKILL.md) with reframe, captions, first-class
+audio_overlays, and per-overlay enabled/locked/provenance so the plan can be
+reviewed and partially regenerated.
+"""
 
-from app.server.paths import APP_HOME
+import uuid
 
-RECENTS_PATH = APP_HOME / "recents.json"
-MAX_RECENTS = 10
-
-
-def load_recents() -> list[str]:
-    if not RECENTS_PATH.exists():
-        return []
-    data = json.loads(RECENTS_PATH.read_text(encoding="utf-8"))
-    return [str(p) for p in data] if isinstance(data, list) else []
+PLAN_VERSION = 2
+VALID_ASPECTS = ("9:16", "original")
+VALID_OVERLAY_KINDS = ("broll", "graphic", "still")
 
 
-def add_recent(folder: Path) -> list[str]:
-    resolved = str(folder.resolve())
-    items = [resolved, *[p for p in load_recents() if p != resolved]]
-    items = items[:MAX_RECENTS]
-    RECENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RECENTS_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
-    return items
-```
-
-`app/server/inventory.py`:
-
-```python
-from __future__ import annotations
-
-import json
-import subprocess
-from pathlib import Path
-
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".webm", ".avi"}
-
-
-def find_videos(folder: Path) -> list[Path]:
-    return sorted(
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS
-    )
-
-
-def _fps(rate: str | None) -> float | None:
-    if not rate or rate in ("0/0", "N/A"):
-        return None
-    if "/" in rate:
-        a, b = rate.split("/", 1)
-        try:
-            return float(a) / float(b)
-        except (TypeError, ValueError, ZeroDivisionError):
-            return None
-    try:
-        return float(rate)
-    except (TypeError, ValueError):
-        return None
-
-
-def probe_source(path: Path, *, run=subprocess.run) -> dict:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-show_entries", "stream=width,height,avg_frame_rate,codec_type",
-        "-of", "json",
-        str(path),
-    ]
-    proc = run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    info = {
-        "name": path.name,
-        "path": str(path.resolve()),
-        "duration_s": None,
-        "width": None,
-        "height": None,
-        "fps": None,
-        "error": None,
+def new_plan(project_id: str, source_path: str) -> dict:
+    return {
+        "version": PLAN_VERSION,
+        "project_id": project_id,
+        "sources": {"main": str(source_path)},
+        "ranges": [],
+        "reframe": {"aspect": "9:16", "center_x": 0.5},
+        "captions": {"style": "bold", "karaoke": True, "burn": True},
+        "overlays": [],
+        "audio_overlays": [],
+        "grade": "none",
+        "total_duration_s": 0.0,
+        "provider": None,
     }
-    if proc.returncode != 0:
-        info["error"] = (proc.stderr or "ffprobe failed")[:400]
-        return info
+
+
+def overlay(kind: str, start_in_output: float, duration: float, **extra) -> dict:
+    item = {
+        "id": f"ov_{uuid.uuid4().hex[:8]}",
+        "kind": kind,
+        "start_in_output": float(start_in_output),
+        "duration": float(duration),
+        "file": None,
+        "enabled": True,
+        "locked": False,
+    }
+    item.update(extra)
+    return item
+
+
+def validate(plan: dict) -> list:
+    """Return a list of human-readable errors. Empty means valid."""
+    errors = []
+
+    if plan.get("version") != PLAN_VERSION:
+        errors.append(f"version must be {PLAN_VERSION}, got {plan.get('version')!r}")
+
+    sources = plan.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        errors.append("sources must be a non-empty object")
+        return errors
+
+    ranges = plan.get("ranges")
+    if not isinstance(ranges, list) or not ranges:
+        errors.append("ranges must be a non-empty array")
+        return errors
+
+    for i, r in enumerate(ranges):
+        if not isinstance(r, dict):
+            errors.append(f"ranges[{i}] must be an object")
+            continue
+        if r.get("source") not in sources:
+            errors.append(f"ranges[{i}].source {r.get('source')!r} is not in sources")
+            continue
+        try:
+            start = float(r["start"])
+            end = float(r["end"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"ranges[{i}] needs numeric start and end")
+            continue
+        if start < 0 or end <= start:
+            errors.append(f"ranges[{i}] requires 0 <= start < end (got {start}, {end})")
+
+    reframe = plan.get("reframe") or {}
+    if reframe.get("aspect") not in VALID_ASPECTS:
+        errors.append(f"reframe.aspect must be one of {VALID_ASPECTS}")
+    cx = reframe.get("center_x", 0.5)
     try:
-        payload = json.loads(proc.stdout or "{}")
-        dur = (payload.get("format") or {}).get("duration")
-        info["duration_s"] = float(dur) if dur is not None else None
-        for stream in payload.get("streams") or []:
-            if stream.get("codec_type") == "video":
-                info["width"] = stream.get("width")
-                info["height"] = stream.get("height")
-                info["fps"] = _fps(stream.get("avg_frame_rate"))
-                break
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        info["error"] = str(exc)
-    return info
+        if not 0.0 <= float(cx) <= 1.0:
+            errors.append(f"reframe.center_x must be in [0, 1], got {cx}")
+    except (TypeError, ValueError):
+        errors.append(f"reframe.center_x must be numeric, got {cx!r}")
 
+    for i, ov in enumerate(plan.get("overlays") or []):
+        if ov.get("kind") not in VALID_OVERLAY_KINDS:
+            errors.append(f"overlays[{i}].kind must be one of {VALID_OVERLAY_KINDS}")
+        try:
+            if float(ov["duration"]) <= 0:
+                errors.append(f"overlays[{i}].duration must be > 0")
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"overlays[{i}] needs a numeric duration")
+        try:
+            if float(ov["start_in_output"]) < 0:
+                errors.append(f"overlays[{i}].start_in_output must be >= 0")
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"overlays[{i}] needs a numeric start_in_output")
 
-def inventory(folder: Path, *, run=subprocess.run) -> list[dict]:
-    return [probe_source(p, run=run) for p in find_videos(folder)]
+    return errors
 ```
 
-Also add `.webm` / `.WEBM` to `VIDEO_EXTS` in `helpers/transcribe_batch.py` so batch transcribe sees the same files as inventory.
+- [ ] **Step 4: Run test to verify it passes**
 
-- [ ] **Step 4: Run tests**
-
-Run: `pytest tests/test_inventory.py -v`
-
-Expected: PASS
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_plan_model.py -v`
+Expected: PASS, 9 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/server/proc.py app/server/recents.py app/server/inventory.py helpers/transcribe_batch.py tests/test_inventory.py
-git commit -m "feat: inventory sources and remember recent folders"
+git add backend/plan backend/tests/test_plan_model.py
+git commit -m "feat: add EDL v2 plan model with validation"
 ```
 
 ---

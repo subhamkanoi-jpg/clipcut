@@ -1,141 +1,147 @@
-# Task 3 Report: EDL validator, subtitle path escape, Windows font
-
-## Status
-
-**DONE**
+# Task 3 Report: Move transcription onto the queue
 
 ## Summary
 
-Implemented `helpers/edl.py` (`validate_edl`, `escape_subtitles_path`, `default_subtitle_font`, `force_style`) and `tests/test_edl.py`. Wired `helpers/render.py` to use `escape_subtitles_path` and `force_style()` (Arial on Windows, Helvetica elsewhere; EDL `subtitle_style` override). Followed TDD: failing import, then implementation matching the brief verbatim.
+Moved transcription off the `threading.Thread` daemon in `complete_upload` and
+onto the durable Mongo job queue built in Tasks 1-2. Added a `backend/handlers/`
+package with a `transcribe` handler that registers itself in `worker.HANDLERS`
+on import, wired it into `worker.py`'s `_register_handlers()`, and replaced the
+thread spawn + `_run_transcription` in `server.py` with `jobs.enqueue(db, pid,
+"transcribe")`.
 
-## Files created / modified
+## What was implemented
 
-| Path | Role |
-|------|------|
-| `helpers/edl.py` | `ValidationResult`, `validate_edl()`, `escape_subtitles_path()`, `default_subtitle_font()`, `force_style()` |
-| `tests/test_edl.py` | Nine unit tests as specified in the brief |
-| `helpers/render.py` | `SUB_FORCE_STYLE = force_style()`; composite uses `escape_subtitles_path` and optional `force_style_str` |
+- **`backend/handlers/__init__.py`** (new) — package marker docstring, as specified.
+- **`backend/handlers/transcribe.py`** (new) — `run(ctx) -> dict`:
+  - Loads the project doc by `ctx.project_id`; raises if missing.
+  - Reports progress (`10, "transcribing"`).
+  - Calls `transcription.transcribe_video(Path(doc["video_path"]))`.
+  - On success: sets project `status="ready"`, stores `words`, `text`, clears
+    `error`.
+  - On failure: sets project `status="error"` with `error` (truncated to 500
+    chars), then re-raises so the job itself is marked failed by
+    `worker.run_once`.
+  - Registers itself: `worker.HANDLERS["transcribe"] = run` at module scope.
+- **`backend/worker.py`** (modified) — added `_register_handlers()` (imports
+  `handlers.transcribe`, which performs the `HANDLERS` registration as a side
+  effect of import) and calls it as the first statement of `main()`, per the
+  brief's note that `HANDLERS` must exist before handler modules populate it
+  and that this only matters for the standalone worker process (tests import
+  `handlers.transcribe` directly, registering it for themselves).
+- **`backend/server.py`** (modified):
+  - Added `import jobs` to the flat top-level import block.
+  - Removed the now-unused `import transcription` (its only remaining
+    reference was inside the deleted `_run_transcription`).
+  - Replaced `threading.Thread(target=_run_transcription, args=(pid,),
+    daemon=True).start()` with `jobs.enqueue(db, pid, "transcribe")` at the
+    end of `complete_upload`.
+  - Deleted `_run_transcription` entirely.
+- **`backend/tests/test_handler_transcribe.py`** (new) — the two tests exactly
+  as given in the brief (`test_transcribe_stores_words_and_marks_ready`,
+  `test_transcribe_failure_marks_project_error`), verbatim.
 
-## Interfaces
+## TDD evidence
 
-### Produced
-
-```python
-@dataclass
-class ValidationResult:
-    ok: bool
-    errors: list[str]
-    warnings: list[str]
-    edl: dict  # deepcopy; total_duration_s auto-corrected when off by > 0.05s
-
-def validate_edl(edl: dict, *, edit_dir: Path) -> ValidationResult: ...
-def escape_subtitles_path(path: Path) -> str: ...
-def default_subtitle_font() -> str: ...  # "Arial" if sys.platform == "win32" else "Helvetica"
-def force_style(*, font: str | None = None, extra: str | None = None) -> str: ...
-```
-
-### Consumed
-
-Nothing from Tasks 1–2. `render.py` now imports `from edl import force_style, escape_subtitles_path`.
-
-## Behavior
-
-1. **EDL validation:** `sources` must be a non-empty dict; `ranges` a non-empty list. Each `ranges[].source` must be a sources key; each source/overlay path must exist (absolute, or resolved vs `edit_dir`). `start`/`end` numeric, `0 <= start < end`. Unknown keys ignored.
-2. **Duration:** missing or `|total_duration_s - sum(end-start)| > 0.05` → warning and `edl["total_duration_s"] = round(sum, 3)`.
-3. **Path escape:** backslashes → `/`, then `:`, `'`, `[`, `]` escaped for ffmpeg `subtitles=` filter.
-4. **Font:** Arial on `win32`, else Helvetica. `force_style(extra=...)` accepts a full `FontName=` string or a font name.
-5. **render.py compositing:** `build_final_composite(..., force_style_str=SUB_FORCE_STYLE)`. If `edl["subtitle_style"]` is set, `main()` passes `force_style(extra=str(...))`.
-
-## TDD steps executed
-
-1. Wrote `tests/test_edl.py` as specified.
-2. `pytest tests/test_edl.py -v` → `ModuleNotFoundError: No module named 'edl'`.
-3. Implemented `helpers/edl.py` as specified; wired `helpers/render.py`.
-4. `pytest tests/test_edl.py tests/test_stdio.py tests/test_doctor.py -v` → **14 passed**.
-5. Commit: `feat: validate EDL and fix Windows subtitle paths`.
-
-### TDD Evidence
-
-**RED** — after test only, no `helpers/edl.py`:
+**RED** — `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_handler_transcribe.py -v`
 
 ```
-pytest tests/test_edl.py -v
-...
-tests\test_edl.py:8: in <module>
-    from edl import default_subtitle_font, escape_subtitles_path, force_style, validate_edl
-E   ModuleNotFoundError: No module named 'edl'
-!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-============================== 1 error in 0.20s ===============================
+collecting ... collected 0 items / 1 error
+ERROR collecting backend/tests/test_handler_transcribe.py
+ImportError while importing test module ...
+tests\test_handler_transcribe.py:12: in <module>
+    import handlers.transcribe as th
+E   ModuleNotFoundError: No module named 'handlers'
+=========================== short test summary info ===========================
+ERROR tests\test_handler_transcribe.py
+1 error in 0.41s
 ```
 
-**GREEN** — after `edl.py` + `render.py` wiring:
+Matches the brief's expected failure exactly.
+
+**GREEN** — same command after implementation:
 
 ```
-pytest tests/test_edl.py tests/test_stdio.py tests/test_doctor.py -v
-============================= 14 passed in 0.05s ==============================
+tests\test_handler_transcribe.py::test_transcribe_stores_words_and_marks_ready PASSED [ 50%]
+tests\test_handler_transcribe.py::test_transcribe_failure_marks_project_error PASSED [100%]
+
+============================== 2 passed in 0.39s ==============================
 ```
 
-## Tests
+**Step 5 grep check** — `cd backend && grep -n "threading.Thread" server.py`
 
 ```
-tests/test_edl.py::test_valid PASSED
-tests/test_edl.py::test_unknown_source PASSED
-tests/test_edl.py::test_missing_source_file PASSED
-tests/test_edl.py::test_start_not_less_than_end PASSED
-tests/test_edl.py::test_total_duration_autocorrect PASSED
-tests/test_edl.py::test_missing_overlay_file PASSED
-tests/test_edl.py::test_escape_windows_drive PASSED
-tests/test_edl.py::test_default_font_windows PASSED
-tests/test_edl.py::test_force_style_uses_font PASSED
-tests/test_stdio.py::test_configure_stdio_allows_arrows_on_cp1252 PASSED
-tests/test_doctor.py::test_all_required_ok PASSED
-tests/test_doctor.py::test_missing_ffmpeg_fails PASSED
-tests/test_doctor.py::test_missing_key_fails_without_echo PASSED
-tests/test_doctor.py::test_libass_absent PASSED
+391:    threading.Thread(target=_run_export, args=(pid, body.caption_style, reel), daemon=True).start()
 ```
 
-**9/9 edl tests pass; 14/14 specified suite pass.**
+One remaining match, in `start_export` / `_run_export` — the export path, out
+of scope for this task (Task 4). The transcription thread spawn is gone.
 
-## Commit
+**Full backend suite** (excluding the two live-server e2e files per
+instructions):
 
-- **SHA:** `65c9254`
-- **Subject:** `feat: validate EDL and fix Windows subtitle paths`
-- **Branch:** `local-app` (not pushed)
-- **Files in commit:** `helpers/edl.py`, `helpers/render.py`, `tests/test_edl.py` only
-- **Not committed:** `.env`, `.superpowers/`
+```
+cd backend && ../.venv-local/Scripts/python.exe -m pytest --ignore=tests/test_reel_backend.py --ignore=tests/test_backend_e2e.py -q
+.....................                                                    [100%]
+21 passed in 1.00s
+```
+
+All 21 tests pass: 2 new handler tests, 12 existing `test_jobs.py`, 7 existing
+`test_worker.py`. Also confirmed `import server` still succeeds standalone
+(`python -c "import server"`) since none of the runnable tests import
+`server.py` directly.
+
+## Files changed
+
+- `backend/handlers/__init__.py` (new)
+- `backend/handlers/transcribe.py` (new)
+- `backend/worker.py` (modified — `_register_handlers()` + call in `main()`)
+- `backend/server.py` (modified — `import jobs`, removed unused `import
+  transcription`, replaced thread spawn with `jobs.enqueue`, deleted
+  `_run_transcription`)
+- `backend/tests/test_handler_transcribe.py` (new)
+
+Commit: `f551c67` — "feat: run transcription as a queued job" (5 files
+changed, 100 insertions, 16 deletions). Staged explicit paths only
+(`backend/handlers backend/worker.py backend/server.py
+backend/tests/test_handler_transcribe.py`); confirmed via `git status --short`
+before committing that no unrelated files were staged. Pre-existing unstaged
+modifications to `.superpowers/sdd/progress.md` and various `task-*-brief.md`/
+`task-1-report.md` files (present before I started, not touched by this task)
+were left alone.
 
 ## Self-review
 
-### Matches brief
-
-- [x] `ValidationResult` dataclass and `validate_edl(edl, *, edit_dir)` signature
-- [x] Deep copy of EDL; `total_duration_s` auto-correct + warning when off by > 0.05s
-- [x] Source/overlay path resolution (absolute or vs `edit_dir`)
-- [x] Unknown source, missing file, start>=end fail `ok`
-- [x] `escape_subtitles_path` drive colon (`C\:`) and no leftover unescaped `:`
-- [x] `default_subtitle_font()` Arial on win32 / Helvetica else
-- [x] `force_style` includes `FontName=` and `MarginV=90`
-- [x] `render.py` `SUB_FORCE_STYLE = force_style()`; compositing uses `escape_subtitles_path`
-- [x] Optional `force_style_str` on `build_final_composite`; `subtitle_style` threaded from `main()`
-- [x] `main()` `configure_stdio()` left as-is except compositing
-- [x] Import style `from edl import ...`
-- [x] Commit message and file set exact
-
-### Minor notes (not blocking)
-
-- Mid-file `from edl import ...` in `render.py` is as specified (replaces the old constant in place), not PEP 8 top-of-file.
-- `escape_subtitles_path` has a redundant second `s.replace("\\", "/")` after the first line already converted backslashes — kept for brief fidelity.
-- `validate_edl` is not called from `render.py` `main()`; brief only asked to wire path escape and `force_style`.
-- No unit tests for the `render.py` compositing wiring itself; coverage is the edl helpers.
-
-### Security
-
-- No secrets. `.env` not staged or committed.
+- **Completeness**: All six brief steps executed in order (write failing
+  test, confirm RED, implement, confirm GREEN, grep check, commit). Interfaces
+  consumed exactly as documented (`Ctx.progress`, `worker.HANDLERS`,
+  `jobs.enqueue`, `transcription.transcribe_video`). Project document gets
+  `status`, `words`, `text`, `error` fields as specified.
+- **YAGNI**: No scope creep. The one deviation from the brief's literal diff
+  is removing the now-dead `import transcription` line from `server.py` — a
+  direct, zero-risk consequence of deleting `_run_transcription` (it was the
+  only remaining reference). Left the export thread and `_run_export`
+  untouched per "Export moves in Task 4 — leave it alone." Did not touch
+  `jobs.py` or add any new job-queue functionality beyond what Tasks 1-2
+  already provide.
+- **Tests verify real behavior against real Mongo**: Yes. `test_handler_transcribe.py`
+  uses a real `MongoClient` against `clipcut_test` (dropped before/after),
+  performs a real `jobs.enqueue` (real insert), a real `worker.run_once`
+  (real `find_one_and_update` claim, real handler dispatch, real `finish`/
+  `fail` updates), and asserts against real `db.projects.find_one` /
+  `db.jobs.find_one` reads. Only the external network boundary
+  (`transcription.transcribe_video`, which would call ElevenLabs Scribe) is
+  monkeypatched — correct isolation for a unit-level handler test, consistent
+  with how `test_worker.py` mocks handler bodies but exercises the real queue
+  underneath.
+- **Style note**: `worker.py`'s `_register_handlers()` placement (no blank
+  lines before/after the function def, sandwiched between `import jobs as
+  jobs_mod` and `POLL_S = 1.0`) is copied verbatim from the brief rather than
+  reformatted to PEP8 two-blank-line convention used elsewhere in the file.
+  Kept as specified since the brief says its code is to be used verbatim;
+  flagging in case a stricter lint pass is desired later.
 
 ## Concerns
 
-None for functionality or task scope.
-
-## Report path
-
-`C:\Users\Varun B\Developer\video-use\.superpowers\sdd\task-3-report.md`
+None. No blockers, no ambiguity encountered — `server.py`'s actual code
+matched what the brief described at the relevant lines (`complete_upload` /
+`_run_transcription`), so no clarification was needed before starting.

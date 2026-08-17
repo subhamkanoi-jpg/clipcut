@@ -1,276 +1,175 @@
-### Task 3: EDL validator, subtitle path escape, Windows font
+### Task 3: Move transcription onto the queue
 
 **Files:**
-- Create: `helpers/edl.py`
-- Create: `tests/test_edl.py`
-- Modify: `helpers/render.py` (replace inline path escape and `SUB_FORCE_STYLE` font)
+- Create: `backend/handlers/__init__.py`
+- Create: `backend/handlers/transcribe.py`
+- Modify: `backend/worker.py` (import the handler module so it registers)
+- Modify: `backend/server.py:200-222` (replace `threading.Thread` with `jobs.enqueue`; delete `_run_transcription`)
+- Create: `backend/tests/test_handler_transcribe.py`
 
 **Interfaces:**
-- Consumes: nothing from Tasks 1–2
-- Produces:
-  - `validate_edl(edl: dict, *, edit_dir: Path) -> ValidationResult`
-  - `ValidationResult(ok: bool, errors: list[str], warnings: list[str], edl: dict)` — `edl` is a copy with `total_duration_s` auto-corrected when off by more than 0.05s
-  - `escape_subtitles_path(path: Path) -> str`
-  - `default_subtitle_font() -> str` — `"Arial"` on `sys.platform == "win32"`, else `"Helvetica"`
-  - `force_style(*, font: str | None = None, extra: str | None = None) -> str`
+- Consumes: `Ctx`, `HANDLERS` from Task 2; `transcription.transcribe_video` (existing).
+- Produces: `handlers.transcribe.run(ctx) -> dict` registered under kind `"transcribe"`. Sets the project's `status` to `ready` or `error` and stores `words` and `text`.
 
-Validation rules (all errors unless noted):
+- [ ] **Step 1: Write the failing test**
 
-- `sources` must be a dict and `ranges` a non-empty list
-- every `ranges[].source` is a key in `sources`
-- every source path exists (absolute, or resolved relative to `edit_dir`)
-- `start` and `end` are numbers, `start >= 0`, `end > start`
-- if `overlays` is a non-empty list, each item has `file` that exists (resolved vs `edit_dir`)
-- `total_duration_s` missing or `|value - sum(end-start)| > 0.05` → warning, set `edl["total_duration_s"] = sum`
-- unknown keys ignored
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_edl.py`:
+Create `backend/tests/test_handler_transcribe.py`:
 
 ```python
-from __future__ import annotations
-
+import os
 import sys
 from pathlib import Path
 
 import pytest
+from pymongo import MongoClient
 
-from edl import default_subtitle_font, escape_subtitles_path, force_style, validate_edl
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def _edl(tmp: Path, **over):
-    src = tmp / "C0103.MP4"
-    src.write_bytes(b"x")
-    base = {
-        "version": 1,
-        "sources": {"C0103": str(src)},
-        "ranges": [{"source": "C0103", "start": 2.42, "end": 6.85, "beat": "HOOK", "quote": "x", "reason": "y"}],
-        "grade": "none",
-        "overlays": [],
-        "total_duration_s": 4.43,
-    }
-    base.update(over)
-    return base
+import jobs as jobs_mod
+import worker as worker_mod
+import handlers.transcribe as th
 
 
-def test_valid(tmp_path: Path):
-    result = validate_edl(_edl(tmp_path), edit_dir=tmp_path)
-    assert result.ok
-    assert result.errors == []
+@pytest.fixture
+def db():
+    client = MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+    name = "clipcut_test"
+    client.drop_database(name)
+    yield client[name]
+    client.drop_database(name)
 
 
-def test_unknown_source(tmp_path: Path):
-    edl = _edl(tmp_path)
-    edl["ranges"][0]["source"] = "NOPE"
-    result = validate_edl(edl, edit_dir=tmp_path)
-    assert not result.ok
-    assert any("NOPE" in e for e in result.errors)
+def test_transcribe_stores_words_and_marks_ready(db, monkeypatch, tmp_path):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"not-a-real-video")
+    db.projects.insert_one({
+        "id": "p1", "status": "transcribing", "video_path": str(video),
+    })
+    monkeypatch.setattr(
+        th.transcription, "transcribe_video",
+        lambda path: {"words": [{"text": "hi", "start": 0.0, "end": 0.3, "type": "word"}],
+                      "text": "hi"},
+    )
+    jid = jobs_mod.enqueue(db, "p1", "transcribe")
+    worker_mod.run_once(db, "w1")
+
+    doc = db.projects.find_one({"id": "p1"})
+    assert doc["status"] == "ready"
+    assert doc["text"] == "hi"
+    assert len(doc["words"]) == 1
+    assert db.jobs.find_one({"id": jid})["status"] == "done"
 
 
-def test_missing_source_file(tmp_path: Path):
-    edl = _edl(tmp_path)
-    edl["sources"]["C0103"] = str(tmp_path / "missing.mp4")
-    result = validate_edl(edl, edit_dir=tmp_path)
-    assert not result.ok
+def test_transcribe_failure_marks_project_error(db, monkeypatch, tmp_path):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"x")
+    db.projects.insert_one({
+        "id": "p2", "status": "transcribing", "video_path": str(video),
+    })
 
+    def boom(path):
+        raise RuntimeError("Scribe returned 401")
 
-def test_start_not_less_than_end(tmp_path: Path):
-    edl = _edl(tmp_path)
-    edl["ranges"][0]["start"] = 6.85
-    edl["ranges"][0]["end"] = 2.42
-    result = validate_edl(edl, edit_dir=tmp_path)
-    assert not result.ok
+    monkeypatch.setattr(th.transcription, "transcribe_video", boom)
+    jobs_mod.enqueue(db, "p2", "transcribe")
+    worker_mod.run_once(db, "w1")
 
-
-def test_total_duration_autocorrect(tmp_path: Path):
-    edl = _edl(tmp_path, total_duration_s=99.0)
-    result = validate_edl(edl, edit_dir=tmp_path)
-    assert result.ok
-    assert result.warnings
-    assert result.edl["total_duration_s"] == pytest.approx(4.43, abs=0.001)
-
-
-def test_missing_overlay_file(tmp_path: Path):
-    edl = _edl(tmp_path, overlays=[{"file": "animations/slot_1/render.mp4", "start_in_output": 0, "duration": 5}])
-    result = validate_edl(edl, edit_dir=tmp_path)
-    assert not result.ok
-
-
-def test_escape_windows_drive():
-    escaped = escape_subtitles_path(Path(r"C:\Users\Varun B\takes\edit\master.srt"))
-    assert escaped.startswith("C\\:")
-    assert ":" not in escaped.replace("\\:", "")
-    assert "Varun B" in escaped or "Varun\\ B" in escaped
-    assert "master.srt" in escaped
-
-
-def test_default_font_windows(monkeypatch):
-    monkeypatch.setattr(sys, "platform", "win32")
-    assert default_subtitle_font() == "Arial"
-    monkeypatch.setattr(sys, "platform", "darwin")
-    assert default_subtitle_font() == "Helvetica"
-
-
-def test_force_style_uses_font():
-    style = force_style(font="Arial")
-    assert "FontName=Arial" in style
-    assert "MarginV=90" in style
+    doc = db.projects.find_one({"id": "p2"})
+    assert doc["status"] == "error"
+    assert "401" in doc["error"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_edl.py -v`
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_handler_transcribe.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'handlers'`
 
-Expected: FAIL with `ModuleNotFoundError: No module named 'edl'`
+- [ ] **Step 3: Write minimal implementation**
 
-- [ ] **Step 3: Implement `helpers/edl.py`**
+Create `backend/handlers/__init__.py`:
 
 ```python
-"""EDL validation and subtitle helpers used by render.py and the local app."""
+"""Job handlers. Importing a module here registers it in worker.HANDLERS."""
+```
 
-from __future__ import annotations
+Create `backend/handlers/transcribe.py`:
 
-import copy
-import sys
-from dataclasses import dataclass, field
+```python
+"""Transcription job: Scribe -> words on the project document."""
+
 from pathlib import Path
 
-
-@dataclass
-class ValidationResult:
-    ok: bool
-    errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    edl: dict = field(default_factory=dict)
+import transcription
+import worker
 
 
-def _resolve(maybe: str, edit_dir: Path) -> Path:
-    p = Path(maybe)
-    return p if p.is_absolute() else (edit_dir / p).resolve()
-
-
-def validate_edl(edl: dict, *, edit_dir: Path) -> ValidationResult:
-    out = copy.deepcopy(edl)
-    errors: list[str] = []
-    warnings: list[str] = []
-    sources = out.get("sources")
-    ranges = out.get("ranges")
-    if not isinstance(sources, dict) or not sources:
-        errors.append("sources must be a non-empty object")
-        return ValidationResult(False, errors, warnings, out)
-    if not isinstance(ranges, list) or not ranges:
-        errors.append("ranges must be a non-empty array")
-        return ValidationResult(False, errors, warnings, out)
-
-    total = 0.0
-    for i, r in enumerate(ranges):
-        if not isinstance(r, dict):
-            errors.append(f"ranges[{i}] must be an object")
-            continue
-        name = r.get("source")
-        if name not in sources:
-            errors.append(f"ranges[{i}].source {name!r} is not in sources")
-            continue
-        path = _resolve(str(sources[name]), edit_dir)
-        if not path.exists():
-            errors.append(f"source {name!r} file missing: {path}")
-        try:
-            start = float(r["start"])
-            end = float(r["end"])
-        except (KeyError, TypeError, ValueError):
-            errors.append(f"ranges[{i}] needs numeric start and end")
-            continue
-        if start < 0 or end <= start:
-            errors.append(f"ranges[{i}] requires 0 <= start < end (got {start}, {end})")
-            continue
-        total += end - start
-
-    overlays = out.get("overlays") or []
-    if overlays:
-        if not isinstance(overlays, list):
-            errors.append("overlays must be an array")
-        else:
-            for i, ov in enumerate(overlays):
-                if not isinstance(ov, dict) or "file" not in ov:
-                    errors.append(f"overlays[{i}] needs a file")
-                    continue
-                op = _resolve(str(ov["file"]), edit_dir)
-                if not op.exists():
-                    errors.append(f"overlay file missing: {op}")
-
-    stated = out.get("total_duration_s")
+def run(ctx) -> dict:
+    doc = ctx.db.projects.find_one({"id": ctx.project_id})
+    if not doc:
+        raise RuntimeError(f"project {ctx.project_id} not found")
+    ctx.progress(10, "transcribing")
     try:
-        stated_f = float(stated) if stated is not None else None
-    except (TypeError, ValueError):
-        stated_f = None
-    if stated_f is None or abs(stated_f - total) > 0.05:
-        warnings.append(f"total_duration_s corrected to {total:.3f}")
-        out["total_duration_s"] = round(total, 3)
-
-    return ValidationResult(ok=not errors, errors=errors, warnings=warnings, edl=out)
-
-
-def escape_subtitles_path(path: Path) -> str:
-    """Escape a Windows path for ffmpeg subtitles= filter (drive colon + specials)."""
-    s = str(path.resolve()).replace("\\", "/")
-    s = s.replace("\\", "/")
-    s = s.replace(":", r"\:")
-    s = s.replace("'", r"\'")
-    s = s.replace("[", r"\[")
-    s = s.replace("]", r"\]")
-    return s
+        payload = transcription.transcribe_video(Path(doc["video_path"]))
+    except Exception as e:
+        ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+            "status": "error", "error": str(e)[:500],
+        }})
+        raise
+    words = payload.get("words") or []
+    ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+        "status": "ready",
+        "words": words,
+        "text": payload.get("text") or "",
+        "error": None,
+    }})
+    return {"word_count": len(words)}
 
 
-def default_subtitle_font() -> str:
-    return "Arial" if sys.platform == "win32" else "Helvetica"
-
-
-def force_style(*, font: str | None = None, extra: str | None = None) -> str:
-    name = font or default_subtitle_font()
-    if extra:
-        # EDL subtitle_style may be a full force_style or just a font name
-        if "FontName=" in extra:
-            return extra
-        name = extra
-    return (
-        f"FontName={name},FontSize=18,Bold=1,"
-        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-        "BorderStyle=1,Outline=2,Shadow=0,"
-        "Alignment=2,MarginV=90"
-    )
+worker.HANDLERS["transcribe"] = run
 ```
 
-In `helpers/render.py`:
-
-- After the `configure_stdio()` import in `main()`, leave `main()` as-is except compositing.
-- Replace the `SUB_FORCE_STYLE = (...)` constant with:
+Modify `backend/worker.py` — add below the `import jobs as jobs_mod` line:
 
 ```python
-from edl import force_style, escape_subtitles_path
+import jobs as jobs_mod
 
-SUB_FORCE_STYLE = force_style()
+# Importing handler modules registers them in HANDLERS. Keep after HANDLERS exists.
+def _register_handlers() -> None:
+    import handlers.transcribe  # noqa: F401
 ```
 
-- In the compositing function, replace the two-line path escape with:
+and call `_register_handlers()` as the first statement inside `main()`.
+
+Note: `HANDLERS` must be defined before `_register_handlers` runs, which is why
+registration happens inside `main()` rather than at import time. Tests import
+`handlers.transcribe` directly, which registers it for them.
+
+Modify `backend/server.py` — delete the `_run_transcription` function
+(lines 208-222) and replace the thread spawn at the end of `complete_upload`:
 
 ```python
-        subs_abs = escape_subtitles_path(subtitles_path)
+    # was: threading.Thread(target=_run_transcription, args=(pid,), daemon=True).start()
+    jobs.enqueue(db, pid, "transcribe")
+    return {"ok": True, "status": "transcribing", "duration": info["duration"]}
 ```
 
-- When building subtitles, if `edl.get("subtitle_style")` is set, use `force_style(extra=str(edl["subtitle_style"]))` instead of `SUB_FORCE_STYLE`. Thread `edl` into `composite()` if it is not already in scope — `main()` has `edl` and already calls the composite helper; add an optional `force_style_str` argument defaulting to `SUB_FORCE_STYLE`.
+Add `import jobs` to the imports at the top of `backend/server.py`.
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/test_edl.py tests/test_stdio.py tests/test_doctor.py -v`
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_handler_transcribe.py -v`
+Expected: PASS, 2 passed
 
-Expected: PASS
+- [ ] **Step 5: Verify the API no longer spawns threads**
 
-- [ ] **Step 5: Commit**
+Run: `cd backend && grep -n "threading.Thread" server.py`
+Expected: one remaining match, in `start_export` — removed in Task 4.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add helpers/edl.py helpers/render.py tests/test_edl.py
-git commit -m "feat: validate EDL and fix Windows subtitle paths"
+git add backend/handlers backend/worker.py backend/server.py backend/tests/test_handler_transcribe.py
+git commit -m "feat: run transcription as a queued job"
 ```
 
 ---

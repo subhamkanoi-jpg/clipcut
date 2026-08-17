@@ -1,208 +1,243 @@
-### Task 2: doctor command
+### Task 2: Worker process
 
 **Files:**
-- Create: `helpers/doctor.py`
-- Create: `tests/test_doctor.py`
+- Create: `backend/worker.py`
+- Create: `backend/tests/test_worker.py`
 
 **Interfaces:**
-- Consumes: `configure_stdio()` from Task 1
-- Produces: `run_doctor(*, which, run, key_loader) -> DoctorReport` where
+- Consumes: `jobs.claim`, `jobs.heartbeat`, `jobs.finish`, `jobs.fail`, `jobs.reconcile_stale`, `jobs.set_progress` from Task 1.
+- Produces: `HANDLERS: dict[str, Callable[[Ctx], dict]]` registry, `Ctx` dataclass with fields `db`, `job`, `project_id`, `payload`, and methods `progress(p: int, stage: str)` and `cancelled() -> bool`; `run_once(db, worker_id) -> bool` (True if a job was processed); `main()`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `backend/tests/test_worker.py`:
 
 ```python
-@dataclass
-class Check:
-    name: str          # "ffmpeg" | "ffprobe" | "libass" | "claude" | "elevenlabs"
-    ok: bool
-    detail: str        # never contains a secret
-    required: bool
+import os
+import sys
 
-@dataclass
-class DoctorReport:
-    checks: list[Check]
-    ok: bool           # True iff every required check is ok
-```
+import pytest
+from pymongo import MongoClient
 
-`key_loader` returns `""` or a non-empty string. `run_doctor` must not put the key in `detail`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-- [ ] **Step 1: Write the failing tests**
-
-`tests/test_doctor.py`:
-
-```python
-from __future__ import annotations
-
-from pathlib import Path
-
-from doctor import run_doctor
+import jobs as jobs_mod
+import worker as worker_mod
 
 
-def _which_ok(name: str):
-    return f"C:/tools/{name}.exe"
+@pytest.fixture
+def db():
+    client = MongoClient(os.environ.get("MONGO_URL", "mongodb://localhost:27017"))
+    name = "clipcut_test"
+    client.drop_database(name)
+    yield client[name]
+    client.drop_database(name)
 
 
-def _which_missing(name: str):
-    return None
+def test_run_once_returns_false_when_queue_empty(db):
+    assert worker_mod.run_once(db, "w1") is False
 
 
-def _run_filters(*_a, **_k):
-    class R:
-        stdout = " T. subtitles     A V  Subtitle filter\n"
-        returncode = 0
-    return R()
+def test_run_once_dispatches_and_finishes(db):
+    seen = {}
+
+    def handler(ctx):
+        seen["project_id"] = ctx.project_id
+        ctx.progress(50, "working")
+        return {"ok": True}
+
+    worker_mod.HANDLERS["dummy"] = handler
+    try:
+        jid = jobs_mod.enqueue(db, "proj1", "dummy")
+        assert worker_mod.run_once(db, "w1") is True
+        doc = db.jobs.find_one({"id": jid})
+        assert doc["status"] == "done"
+        assert doc["result"] == {"ok": True}
+        assert seen["project_id"] == "proj1"
+    finally:
+        del worker_mod.HANDLERS["dummy"]
 
 
-def test_all_required_ok():
-    report = run_doctor(which=_which_ok, run=_run_filters, key_loader=lambda: "sk-test")
-    assert report.ok
-    assert {c.name for c in report.checks} == {"ffmpeg", "ffprobe", "libass", "claude", "elevenlabs"}
-    assert all(c.ok for c in report.checks)
-    assert all("sk-test" not in c.detail for c in report.checks)
+def test_handler_exception_fails_the_job(db):
+    def handler(ctx):
+        raise RuntimeError("kaboom")
+
+    worker_mod.HANDLERS["dummy"] = handler
+    try:
+        jid = jobs_mod.enqueue(db, "proj1", "dummy")
+        worker_mod.run_once(db, "w1")
+        doc = db.jobs.find_one({"id": jid})
+        assert doc["status"] == "error"
+        assert "kaboom" in doc["error"]
+    finally:
+        del worker_mod.HANDLERS["dummy"]
 
 
-def test_missing_ffmpeg_fails():
-    def which(name: str):
-        return None if name == "ffmpeg" else _which_ok(name)
-    report = run_doctor(which=which, run=_run_filters, key_loader=lambda: "x")
-    assert not report.ok
-    ffmpeg = next(c for c in report.checks if c.name == "ffmpeg")
-    assert ffmpeg.ok is False
-    assert ffmpeg.required is True
+def test_unknown_kind_fails_cleanly(db):
+    jid = jobs_mod.enqueue(db, "proj1", "no-such-kind")
+    worker_mod.run_once(db, "w1")
+    doc = db.jobs.find_one({"id": jid})
+    assert doc["status"] == "error"
+    assert "no handler" in doc["error"]
 
 
-def test_missing_key_fails_without_echo():
-    report = run_doctor(which=_which_ok, run=_run_filters, key_loader=lambda: "")
-    key = next(c for c in report.checks if c.name == "elevenlabs")
-    assert key.ok is False
-    assert "missing" in key.detail.lower()
+def test_ctx_cancelled_reflects_flag(db):
+    observed = {}
 
+    def handler(ctx):
+        observed["before"] = ctx.cancelled()
+        jobs_mod.request_cancel(ctx.db, ctx.job["id"])
+        observed["after"] = ctx.cancelled()
+        return {}
 
-def test_libass_absent():
-    class R:
-        stdout = " T. scale         V  Scale\n"
-        returncode = 0
-    report = run_doctor(which=_which_ok, run=lambda *a, **k: R(), key_loader=lambda: "x")
-    libass = next(c for c in report.checks if c.name == "libass")
-    assert libass.ok is False
-    assert libass.required is True
+    worker_mod.HANDLERS["dummy"] = handler
+    try:
+        jobs_mod.enqueue(db, "proj1", "dummy")
+        worker_mod.run_once(db, "w1")
+        assert observed == {"before": False, "after": True}
+    finally:
+        del worker_mod.HANDLERS["dummy"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/test_doctor.py -v`
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_worker.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'worker'`
 
-Expected: FAIL with `ModuleNotFoundError: No module named 'doctor'`
+- [ ] **Step 3: Write minimal implementation**
 
-- [ ] **Step 3: Implement `helpers/doctor.py`**
+Create `backend/worker.py`:
 
 ```python
-"""Preflight: ffmpeg, ffprobe, libass, claude, ElevenLabs key."""
+"""ClipCut job worker. Runs all long work; the API never does.
 
-from __future__ import annotations
+Run from the backend/ directory:
+    ../.venv-local/Scripts/python.exe worker.py
+"""
 
-import argparse
+import logging
 import os
-import re
-import shutil
-import subprocess
+import signal
+import socket
 import sys
-from dataclasses import dataclass, asdict
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from stdio import configure_stdio
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).parent
+load_dotenv(ROOT / ".env")
+
+# helpers/ modules cross-import flatly, so the directory itself goes on the path.
+HELPERS = ROOT.parent / "helpers"
+if str(HELPERS) not in sys.path:
+    sys.path.insert(0, str(HELPERS))
+
+from pymongo import MongoClient
+
+import jobs as jobs_mod
+
+POLL_S = 1.0
+HEARTBEAT_S = 5.0
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("worker")
+
+_shutdown = False
 
 
 @dataclass
-class Check:
-    name: str
-    ok: bool
-    detail: str
-    required: bool
+class Ctx:
+    db: object
+    job: dict
+    project_id: str
+    payload: dict
+
+    def progress(self, p: int, stage: str) -> None:
+        jobs_mod.set_progress(self.db, self.job["id"], p, stage)
+        jobs_mod.heartbeat(self.db, self.job["id"])
+
+    def cancelled(self) -> bool:
+        return jobs_mod.is_cancelled(self.db, self.job["id"])
 
 
-@dataclass
-class DoctorReport:
-    checks: list[Check]
-
-    @property
-    def ok(self) -> bool:
-        return all(c.ok for c in self.checks if c.required)
-
-    def to_dict(self) -> dict:
-        return {"ok": self.ok, "checks": [asdict(c) for c in self.checks]}
+class Cancelled(Exception):
+    """Raised by a handler when it notices ctx.cancelled()."""
 
 
-def _load_key_from_env_files() -> str:
-    repo_env = Path(__file__).resolve().parent.parent / ".env"
-    for candidate in (repo_env, Path(".env")):
-        if not candidate.exists():
-            continue
-        for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == "ELEVENLABS_API_KEY":
-                return v.strip().strip('"').strip("'")
-    return os.environ.get("ELEVENLABS_API_KEY", "")
+HANDLERS: dict = {}
 
 
-def run_doctor(*, which=shutil.which, run=subprocess.run, key_loader=_load_key_from_env_files) -> DoctorReport:
-    checks: list[Check] = []
-    for name in ("ffmpeg", "ffprobe", "claude"):
-        path = which(name)
-        checks.append(Check(name=name, ok=bool(path), detail=path or "not on PATH", required=True))
+def run_once(db, worker_id: str) -> bool:
+    job = jobs_mod.claim(db, list(HANDLERS.keys()) or ["__none__"], worker_id)
+    if not job:
+        return False
+    handler = HANDLERS.get(job["kind"])
+    if handler is None:
+        jobs_mod.fail(db, job["id"], f"no handler for kind {job['kind']!r}")
+        return True
+    ctx = Ctx(db=db, job=job, project_id=job["project_id"], payload=job.get("payload") or {})
+    try:
+        result = handler(ctx)
+        jobs_mod.finish(db, job["id"], result or {})
+    except Cancelled:
+        db.jobs.update_one({"id": job["id"]}, {"$set": {
+            "status": "cancelled", "stage": "cancelled",
+        }})
+        log.info("job %s cancelled", job["id"])
+    except Exception as e:
+        log.exception("job %s failed", job["id"])
+        jobs_mod.fail(db, job["id"], str(e))
+    return True
 
-    ffmpeg = which("ffmpeg")
-    if ffmpeg:
-        proc = run(
-            [ffmpeg, "-hide_banner", "-filters"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        has_subs = bool(re.search(r"^\s*\S+\s+subtitles\s", proc.stdout or "", re.M))
-        checks.append(Check(
-            name="libass",
-            ok=has_subs,
-            detail="subtitles filter present" if has_subs else "ffmpeg has no subtitles/libass filter",
-            required=True,
-        ))
-    else:
-        checks.append(Check(name="libass", ok=False, detail="ffmpeg missing", required=True))
 
-    key = key_loader() or ""
-    checks.append(Check(
-        name="elevenlabs",
-        ok=bool(key.strip()),
-        detail="present" if key.strip() else "missing — set ELEVENLABS_API_KEY in Developer/video-use/.env",
-        required=True,
-    ))
-    return DoctorReport(checks=checks)
+def _handle_signal(signum, frame):
+    global _shutdown
+    _shutdown = True
+    log.info("shutdown requested")
 
 
 def main() -> None:
-    configure_stdio()
-    argparse.ArgumentParser(description="Check video-use dependencies").parse_args()
-    report = run_doctor()
-    for c in report.checks:
-        mark = "ok" if c.ok else "FAIL"
-        print(f"{mark:4}  {c.name:12}  {c.detail}")
-    sys.exit(0 if report.ok else 1)
+    client = MongoClient(os.environ["MONGO_URL"])
+    db = client[os.environ["DB_NAME"]]
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    requeued = jobs_mod.reconcile_stale(db)
+    if requeued:
+        log.info("requeued %d stale job(s)", requeued)
+    log.info("worker %s ready, handlers: %s", worker_id, sorted(HANDLERS))
+
+    while not _shutdown:
+        try:
+            if not run_once(db, worker_id):
+                time.sleep(POLL_S)
+        except Exception:
+            log.exception("worker loop error")
+            time.sleep(POLL_S)
+    log.info("worker stopped")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/test_doctor.py -v`
-
-Expected: PASS
+Run: `cd backend && ../.venv-local/Scripts/python.exe -m pytest tests/test_worker.py -v`
+Expected: PASS, 5 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add helpers/doctor.py tests/test_doctor.py
-git commit -m "feat: add helpers/doctor.py preflight"
+git add backend/worker.py backend/tests/test_worker.py
+git commit -m "feat: add job worker with handler registry and cancellation"
 ```
 
 ---
