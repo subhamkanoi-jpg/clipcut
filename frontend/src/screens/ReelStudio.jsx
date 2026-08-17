@@ -9,8 +9,10 @@ import { CAPTION_STYLES, formatTime } from "../lib/captions";
 import ProjectLibrary from "../components/ProjectLibrary";
 
 const STAGE_LABEL = {
+  reframing: "Locating the speaker for vertical reframe",
   cutting: "Cutting on speech beats + zooming",
   captioning: "Burning karaoke captions",
+  compositing: "Compositing overlays + captions",
   mastering: "Mastering audio to -14 LUFS",
   done: "Finishing up",
 };
