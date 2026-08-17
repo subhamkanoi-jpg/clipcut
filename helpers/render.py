@@ -200,6 +200,20 @@ def is_portrait_source(video: Path) -> bool:
     return bool(size and size[1] > size[0])
 
 
+def has_audio_stream(video: Path) -> bool:
+    """Return True if `video` has at least one audio stream."""
+    try:
+        out = _hidden_run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=index",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        return bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
@@ -826,15 +840,20 @@ def build_final_composite(
 
     filter_complex = ";".join(filter_parts)
 
+    # A source with no audio stream (e.g. a silent screen recording) has no
+    # `0:a` to map -- hardcoding it here made the whole composite pass fail
+    # outright instead of just producing a silent output, unlike the old
+    # burn_captions, which used a bare `-c:a copy` and tolerated this.
+    audio_flags = ["-map", "0:a", "-c:a", "copy"] if has_audio_stream(base_path) else []
+
     cmd = [
         "ffmpeg", "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
-        "-map", "0:a",
+        *audio_flags,
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
         "-movflags", "+faststart",
         str(out_path),
     ]
