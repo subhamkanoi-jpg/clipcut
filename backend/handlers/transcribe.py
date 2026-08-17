@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import jobs
 import transcription
 import worker
 from errors import Cancelled
@@ -32,6 +33,7 @@ def run(ctx) -> dict:
         "text": payload.get("text") or "",
         "error": None,
     }})
+    jobs.enqueue(ctx.db, ctx.project_id, "plan")
     return {"word_count": len(words)}
 
 

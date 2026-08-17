@@ -52,6 +52,8 @@ def run(ctx) -> dict:
 
         state = compute_cut_state({**doc, "reel_settings": reel})
         edl = assemble.from_project({**doc, "caption_style": style_key}, state)
+        stored = (doc.get("plan") or {}).get("overlays") or []
+        edl["overlays"] = [o for o in stored if o.get("enabled")]
         meta = render_plan.render(
             edl, pdir, out_path,
             words=doc.get("words") or [],

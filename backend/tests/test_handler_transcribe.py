@@ -59,3 +59,16 @@ def test_transcribe_failure_marks_project_error(db, monkeypatch, tmp_path):
     doc = db.projects.find_one({"id": "p2"})
     assert doc["status"] == "error"
     assert "401" in doc["error"]
+
+
+def test_transcribe_success_enqueues_a_plan_job(db, monkeypatch, tmp_path):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"x")
+    db.projects.insert_one({"id": "p9", "status": "transcribing", "video_path": str(video)})
+    monkeypatch.setattr(
+        th.transcription, "transcribe_video",
+        lambda path: {"words": [{"text": "hi", "start": 0.0, "end": 0.3, "type": "word"}], "text": "hi"},
+    )
+    jobs_mod.enqueue(db, "p9", "transcribe")
+    worker_mod.run_once(db, "w1")
+    assert db.jobs.find_one({"project_id": "p9", "kind": "plan"}) is not None

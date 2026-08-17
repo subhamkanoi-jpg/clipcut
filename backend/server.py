@@ -369,6 +369,28 @@ def download_export(pid: str):
     return FileResponse(path, media_type="video/mp4", filename=f"{stem}_reel.mp4")
 
 
+class PlanBody(BaseModel):
+    regenerate: bool = False
+
+
+@api.post("/projects/{pid}/plan")
+def start_plan(pid: str, body: PlanBody):
+    get_project_or_404(pid)
+    projects.update_one({"id": pid}, {"$set": {"plan_status": "planning"}})
+    jid = jobs.enqueue(db, pid, "plan", {"regenerate": body.regenerate})
+    return {"ok": True, "job_id": jid}
+
+
+@api.get("/projects/{pid}/plan")
+def get_plan(pid: str):
+    doc = get_project_or_404(pid)
+    plan = doc.get("plan")
+    if not plan:
+        raise HTTPException(404, "no plan yet")
+    return {"plan": plan, "provider": doc.get("plan_provider"),
+            "status": doc.get("plan_status")}
+
+
 @api.get("/jobs/{jid}")
 def get_job(jid: str):
     doc = db.jobs.find_one({"id": jid}, {"_id": 0})
