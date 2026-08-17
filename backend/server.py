@@ -340,5 +340,5 @@ def storage_status():
 def health():
     return {"status": "ok", "service": "clipcut-cloud"}
 
-app.include_router(api)
+app.include_router(api, prefix="/api")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
