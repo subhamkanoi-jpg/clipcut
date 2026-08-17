@@ -78,6 +78,35 @@ powershell -ExecutionPolicy Bypass -File app\scripts\dev.ps1
 
 See `install.md` for full Windows setup (ffmpeg via winget, skill junction, and launch).
 
+### ClipCut (browser reel editor)
+
+ClipCut is the web app in `backend/` + `frontend/`: upload a talking-head clip and
+get back a captioned, speech-cut, face-centered 9:16 reel. It shares the renderer
+in `helpers/` with the skill above.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
+```
+
+That starts **three** processes — the API on :8000, the job worker, and the
+frontend on :3000. The script skips anything already running, so it is safe to
+re-run. Requires MongoDB running locally and an `ELEVENLABS_API_KEY` in
+`backend\.env`.
+
+The worker is not optional. The API only enqueues jobs; without the worker,
+uploads sit at `transcribing` forever.
+
+**Do not install `backend/requirements.txt`.** It is a stale lockfile pinning a
+private wheel URL plus packages the app never imports. The real dependency set is:
+
+```
+fastapi uvicorn pymongo python-dotenv python-multipart requests
+opencv-python-headless==4.11.0.86 cloudinary pillow httpx
+```
+
+`opencv-python-headless` must stay at `4.11.0.86` — newer builds crash the
+face-detection path used for 9:16 reframing.
+
 
 ## How it works
 
