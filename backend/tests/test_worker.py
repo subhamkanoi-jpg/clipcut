@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pymongo import MongoClient
@@ -65,12 +66,20 @@ def test_handler_exception_fails_the_job(db):
         del worker_mod.HANDLERS["dummy"]
 
 
-def test_unknown_kind_fails_cleanly(db):
+def test_unknown_kind_is_left_queued_not_claimed(db):
+    # Minor 5 fix: run_once used to claim ANY queued kind (registered or
+    # not) and immediately fail unregistered ones with "no handler for
+    # kind". That's a footgun -- a job enqueued for a kind a future
+    # sub-project adds (e.g. "plan") before any worker registers a handler
+    # for it would be claimed and permanently destroyed instead of waiting.
+    # claim() is now scoped to `list(HANDLERS)`, so an unregistered kind
+    # must be left alone: still queued, untouched, ready for a worker that
+    # knows about it.
     jid = jobs_mod.enqueue(db, "proj1", "no-such-kind")
-    worker_mod.run_once(db, "w1")
+    assert worker_mod.run_once(db, "w1") is False
     doc = db.jobs.find_one({"id": jid})
-    assert doc["status"] == "error"
-    assert "no handler" in doc["error"]
+    assert doc["status"] == "queued"
+    assert doc["error"] is None
 
 
 def test_ctx_cancelled_reflects_flag(db):
@@ -105,6 +114,50 @@ def test_handler_raising_cancelled_marks_job_cancelled(db):
         assert doc["finished_at"] is not None
     finally:
         del worker_mod.HANDLERS["dummy"]
+
+
+# Finding 5a: reconcile_stale() used to run only at worker boot. Kill the
+# worker a few seconds after a heartbeat and restart inside the 60s lease
+# window and lease_expires_at is still in the future -- the job is neither
+# requeued nor failed and sits in "processing" forever. maybe_reconcile()
+# lets the poll loop call reconcile_stale() periodically without a
+# dependency or a background thread; these tests exercise it as a pure
+# function of (last_reconcile_at, now) rather than sleeping for real time.
+
+
+def test_maybe_reconcile_skips_before_interval(db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(jobs_mod, "reconcile_stale", lambda db_: calls.append(1) or 0)
+
+    result = worker_mod.maybe_reconcile(db, last_reconcile_at=100.0, now=110.0, interval_s=30.0)
+
+    assert result == 100.0
+    assert calls == []
+
+
+def test_maybe_reconcile_runs_after_interval_and_advances_timestamp(db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(jobs_mod, "reconcile_stale", lambda db_: calls.append(1) or 2)
+
+    result = worker_mod.maybe_reconcile(db, last_reconcile_at=100.0, now=131.0, interval_s=30.0)
+
+    assert result == 131.0
+    assert calls == [1]
+
+
+def test_maybe_reconcile_integrates_with_real_reconcile_stale(db):
+    # No monkeypatching: a job whose lease already expired must actually get
+    # requeued once the interval has elapsed, using the real jobs_mod.reconcile_stale.
+    jid = jobs_mod.enqueue(db, "proj1", "render")
+    jobs_mod.claim(db, ["render"], "worker-a")
+    db.jobs.update_one(
+        {"id": jid},
+        {"$set": {"lease_expires_at": datetime.now(timezone.utc) - timedelta(seconds=5)}},
+    )
+
+    worker_mod.maybe_reconcile(db, last_reconcile_at=0.0, now=999.0, interval_s=30.0)
+
+    assert db.jobs.find_one({"id": jid})["status"] == "queued"
 
 
 def test_progress_warns_when_lease_lost(db, caplog):

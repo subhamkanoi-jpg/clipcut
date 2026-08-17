@@ -26,6 +26,7 @@ if str(HELPERS) not in sys.path:
 from pymongo import MongoClient
 
 import jobs as jobs_mod
+from errors import Cancelled
 
 # Importing handler modules registers them in HANDLERS. Keep after HANDLERS exists.
 def _register_handlers() -> None:
@@ -33,6 +34,13 @@ def _register_handlers() -> None:
     import handlers.export      # noqa: F401
 
 POLL_S = 1.0
+
+# reconcile_stale() used to run only at worker boot, so a job whose lease was
+# still inside its 60s window when the worker died (e.g. killed a few seconds
+# after a heartbeat, restarted inside the lease) would sit in "processing"
+# forever -- neither requeued nor failed. Running it periodically from the
+# poll loop closes that gap without a dependency or a background thread.
+RECONCILE_INTERVAL_S = 30.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,25 +71,31 @@ class Ctx:
         return jobs_mod.is_cancelled(self.db, self.job["id"])
 
 
-class Cancelled(Exception):
-    """Raised by a handler when it notices ctx.cancelled()."""
-
+# `Cancelled` above is imported (not defined here) from errors.py, but stays
+# accessible as `worker.Cancelled` for backward compatibility -- it's the
+# same class object as errors.Cancelled, not a copy, so `except
+# worker.Cancelled` and `except errors.Cancelled` catch the same instances.
+# New code should import from errors directly.
 
 HANDLERS: dict = {}
 
 
 def run_once(db, worker_id: str) -> bool:
-    # Claim any queued job, regardless of handler registration
-    # Then check if we have a handler for it
-    all_kinds = db.jobs.distinct("kind", {"status": "queued"})
-    kinds_to_claim = list(HANDLERS.keys()) + [k for k in all_kinds if k not in HANDLERS]
-    if not kinds_to_claim:
-        kinds_to_claim = ["__none__"]
-    job = jobs_mod.claim(db, kinds_to_claim, worker_id)
+    # Only claim kinds this worker actually has a handler for. Claiming any
+    # queued kind (including ones no handler is registered for) meant a job
+    # enqueued for a not-yet-deployed kind (e.g. a new "plan" kind added by a
+    # future sub-project) would be claimed and immediately destroyed with
+    # "no handler for kind" instead of waiting in the queue for a worker that
+    # knows about it.
+    job = jobs_mod.claim(db, list(HANDLERS), worker_id)
     if not job:
         return False
     handler = HANDLERS.get(job["kind"])
     if handler is None:
+        # Defense in depth: claim() above should make this unreachable in
+        # normal operation since it only claims registered kinds, but keep
+        # the guard (and its project reconciliation, via jobs_mod.fail) in
+        # case HANDLERS is ever mutated between claim and dispatch.
         jobs_mod.fail(db, job["id"], f"no handler for kind {job['kind']!r}")
         return True
     ctx = Ctx(db=db, job=job, project_id=job["project_id"], payload=job.get("payload") or {})
@@ -95,6 +109,23 @@ def run_once(db, worker_id: str) -> bool:
         log.exception("job %s failed", job["id"])
         jobs_mod.fail(db, job["id"], str(e))
     return True
+
+
+def maybe_reconcile(db, last_reconcile_at: float, now: float,
+                    interval_s: float = RECONCILE_INTERVAL_S) -> float:
+    """Run reconcile_stale() if `interval_s` has elapsed since the last run.
+
+    Returns the (possibly updated) "last reconciled at" timestamp so the
+    caller can thread it through the poll loop. Takes `now` as a parameter
+    (rather than calling time.monotonic() itself) so it's a pure function of
+    its inputs and testable without real elapsed time.
+    """
+    if now - last_reconcile_at < interval_s:
+        return last_reconcile_at
+    requeued = jobs_mod.reconcile_stale(db)
+    if requeued:
+        log.info("requeued %d stale job(s)", requeued)
+    return now
 
 
 def _handle_signal(signum, frame):
@@ -125,10 +156,12 @@ def main() -> None:
         log.info("requeued %d stale job(s)", requeued)
     log.info("worker %s ready, handlers: %s", worker_id, sorted(HANDLERS))
 
+    last_reconcile_at = time.monotonic()
     while not _shutdown:
         try:
             if not run_once(db, worker_id):
                 time.sleep(POLL_S)
+            last_reconcile_at = maybe_reconcile(db, last_reconcile_at, time.monotonic())
         except Exception:
             log.exception("worker loop error")
             time.sleep(POLL_S)
@@ -138,6 +171,7 @@ def main() -> None:
 if __name__ == "__main__":
     # Re-enter under the module's real name. Handler modules do `import worker`,
     # so running this file directly would otherwise create a second module object
-    # whose HANDLERS dict and Cancelled class are distinct from this one.
+    # whose HANDLERS dict is distinct from this one (Cancelled is unaffected --
+    # it lives in errors.py, which both module objects import identically).
     from worker import main as _main
     _main()
