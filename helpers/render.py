@@ -204,13 +204,19 @@ def is_portrait_source(video: Path) -> bool:
 
 
 def cover_crop_filter(src_w: int, src_h: int, center_x: float = 0.5,
-                      draft: bool = False) -> str:
+                      draft: bool = False, out_size: tuple[int, int] | None = None) -> str:
     """Scale-to-cover then crop to a vertical canvas, keeping center_x in frame.
 
     center_x is the subject's horizontal position as a fraction of source width.
     The crop window is clamped so it never runs past either edge.
+
+    `out_size`, when given, overrides the (720x1280 draft / 1080x1920 final)
+    canvas — used by the animated-zoom path in `extract_segment` to crop to a
+    *prescaled* canvas (target * PRESCALE) instead of the final output size,
+    so `zoompan` has headroom to animate within. Callers that don't pass it
+    get exactly today's behaviour.
     """
-    out_w, out_h = (720, 1280) if draft else (1080, 1920)
+    out_w, out_h = out_size if out_size else ((720, 1280) if draft else (1080, 1920))
     if not src_w or not src_h:
         return f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}"
 
@@ -228,6 +234,82 @@ def cover_crop_filter(src_w: int, src_h: int, center_x: float = 0.5,
     return f"scale={scaled_w}:{scaled_h},crop={out_w}:{out_h}:x={x}:y={y}"
 
 
+# -------- Animated zoom (speech-driven camera moves) ------------------------
+#
+# Ported faithfully from `backend/render_engine.py` (deleted; see
+# `git show 05cd377^:backend/render_engine.py`) — the renderer that shipped
+# ClipCut's zoom/punch-in feature before the migration to this module dropped
+# it. Do not re-derive this math from scratch; if it needs to change, re-port
+# from that commit rather than inventing new easing.
+#
+# A `move` dict (see `backend/zooms.py::plan`) describes one segment's camera
+# move: a z0 -> z1 zoom ramp across the segment's duration, plus an optional
+# list of per-word "snap" accents (quick zoom-in-and-decay pulses) layered on
+# top. `zoompan` animates this by reading the *scaled-up* (PRESCALE) frame and
+# cropping a `zoom`-dependent window back down to the target size every frame.
+
+PRESCALE = 1.3
+
+
+def _even(n: float) -> int:
+    return max(2, int(round(n / 2)) * 2)
+
+
+def _zoompan_expr(move: dict, duration: float, fps: int) -> str:
+    """Build the zoompan `z=` expression: a linear z0->z1 ramp over the
+    segment's frames, plus one decaying term per snap. Faithful port of
+    render_engine.extract_segment's zexpr construction.
+    """
+    frames = max(1, int(duration * fps))
+    z0 = float(move.get("z0", 1.0))
+    z1 = float(move.get("z1", 1.0))
+    dz = z1 - z0
+    terms = [f"{z0:.4f}+({dz:.4f})*on/{frames}"]
+    for snap in move.get("snaps") or []:
+        f0 = int(float(snap["t"]) * fps)
+        f1 = f0 + max(2, int(float(snap.get("decay", 0.45)) * fps))
+        if f0 >= frames:
+            continue
+        terms.append(
+            f"if(between(on,{f0},{f1}),{float(snap['amp']):.4f}*(1-(on-{f0})/{f1 - f0}),0)"
+        )
+    return f"min({PRESCALE - 0.03:.3f},max(1,{'+'.join(terms)}))"
+
+
+def _zoompan_filter(move: dict, duration: float, fps: int, target_w: int, target_h: int) -> str:
+    zexpr = _zoompan_expr(move, duration, fps)
+    return (
+        f"zoompan=z='{zexpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d=1:s={target_w}x{target_h}:fps={fps}"
+    )
+
+
+def _is_zooming(move: dict | None) -> bool:
+    if not move:
+        return False
+    return (
+        float(move.get("z0", 1.0)) > 1.001
+        or float(move.get("z1", 1.0)) > 1.001
+        or bool(move.get("snaps"))
+    )
+
+
+def _zoom_target_dims(cover: bool, draft: bool, src_w: int, src_h: int, portrait: bool) -> tuple[int, int]:
+    """The final aspect-correct pixel size `zoompan` must land on, before the
+    PRESCALE headroom is added. Mirrors render_engine.target_size()."""
+    if cover:
+        return (720, 1280) if draft else (1080, 1920)
+    cap = 1280 if draft else 1920
+    w, h = src_w or 1920, src_h or 1080
+    if portrait:
+        H = min(cap, h)
+        W = _even(w * H / h)
+        return W, _even(H)
+    W = min(cap, w)
+    H = _even(h * W / w)
+    return _even(W), H
+
+
 def extract_segment(
     source: Path,
     seg_start: float,
@@ -239,11 +321,24 @@ def extract_segment(
     zoom: float = 1.0,
     cover: bool = False,
     center_x: float = 0.5,
+    move: dict | None = None,
+    fps: int = 24,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
+
+    `move`, when given, requests an animated speech-driven zoom (a z0->z1 ramp
+    with optional per-word snap accents) instead of the static `zoom` crop —
+    see the "Animated zoom" section above. When `move` is None (the default,
+    and the only mode the standalone `video-use` skill ever requests), this
+    function's output is byte-for-byte the same ffmpeg invocation as before
+    this parameter existed.
+
+    `fps` sets the output frame rate (`-r`) and, when animating, the frame
+    rate `zoompan` paces its ramp against. Defaults to 24 to match today's
+    behaviour for every existing caller; ClipCut's render pipeline passes 30.
 
     Quality ladder:
       - final (default): 1080p libx264 fast CRF 20
@@ -253,30 +348,52 @@ def extract_segment(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if cover:
-        size = probe_video_size(source)
-        # Only feed concrete pixel dimensions to cover_crop_filter when the
-        # probe actually succeeded. On probe failure, pass (0, 0) so its own
-        # `not src_w or not src_h` guard returns the aspect-safe, ffmpeg-native
-        # scale+crop string (force_original_aspect_ratio=increase) instead of
-        # emitting concrete numbers computed from a guessed size — guessing
-        # would stretch the frame whenever the real source isn't 16:9.
-        src_w, src_h = size if size else (0, 0)
-        scale = cover_crop_filter(src_w, src_h, center_x, draft=draft)
-    elif draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+    zooming = _is_zooming(move)
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
-    vf_parts.append(scale)
-    if zoom and zoom > 1.01:
-        vf_parts.append(
-            f"scale=2*trunc(iw*{zoom:.3f}/2):2*trunc(ih*{zoom:.3f}/2),"
-            f"crop=trunc(iw/{zoom:.3f}/2)*2:trunc(ih/{zoom:.3f}/2)*2"
-        )
+
+    if zooming:
+        # Only feed concrete pixel dimensions to cover_crop_filter when the
+        # probe actually succeeded. On probe failure, pass (0, 0) so its own
+        # `not src_w or not src_h` guard returns the aspect-safe, ffmpeg-native
+        # scale+crop string instead of emitting concrete numbers computed from
+        # a guessed size — guessing would stretch the frame whenever the real
+        # source isn't 16:9.
+        size = probe_video_size(source)
+        src_w, src_h = size if size else (0, 0)
+        target_w, target_h = _zoom_target_dims(cover, draft, src_w, src_h, portrait)
+        pw, ph = _even(target_w * PRESCALE), _even(target_h * PRESCALE)
+        if cover:
+            vf_parts.append(cover_crop_filter(src_w, src_h, center_x, draft=draft, out_size=(pw, ph)))
+        else:
+            vf_parts.append(f"scale={pw}:{ph}:flags=bicubic")
+        vf_parts.append(f"fps={fps}")
+        vf_parts.append(_zoompan_filter(move, duration, fps, target_w, target_h))
+        vf_parts.append("setsar=1")
+    else:
+        if cover:
+            size = probe_video_size(source)
+            # Only feed concrete pixel dimensions to cover_crop_filter when the
+            # probe actually succeeded. On probe failure, pass (0, 0) so its own
+            # `not src_w or not src_h` guard returns the aspect-safe, ffmpeg-native
+            # scale+crop string (force_original_aspect_ratio=increase) instead of
+            # emitting concrete numbers computed from a guessed size — guessing
+            # would stretch the frame whenever the real source isn't 16:9.
+            src_w, src_h = size if size else (0, 0)
+            scale = cover_crop_filter(src_w, src_h, center_x, draft=draft)
+        elif draft:
+            scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+        else:
+            scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        vf_parts.append(scale)
+        if zoom and zoom > 1.01:
+            vf_parts.append(
+                f"scale=2*trunc(iw*{zoom:.3f}/2):2*trunc(ih*{zoom:.3f}/2),"
+                f"crop=trunc(iw/{zoom:.3f}/2)*2:trunc(ih/{zoom:.3f}/2)*2"
+            )
+
     if grade_filter:
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
@@ -300,7 +417,7 @@ def extract_segment(
         "-vf", vf,
         "-af", af,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
+        "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
