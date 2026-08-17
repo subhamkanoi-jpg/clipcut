@@ -39,8 +39,46 @@ def test_progress_callback_reports_named_stages(tmp_path, monkeypatch):
     render_plan.render(_plan(tmp_path), tmp_path, tmp_path / "out.mp4",
                        words=[], progress_cb=lambda p, s: seen.append(s))
 
-    assert [s for s in ("cutting", "compositing", "captioning", "mastering")
-            if s in seen] == ["cutting", "compositing", "captioning", "mastering"]
+    # "compositing" must land on the real composite pass, which only starts
+    # after captions are built -- not on the cheap concat that precedes both
+    # (see Finding 6: this used to be ticked as "compositing" before "cutting"
+    # had even finished captioning, which was still ticked "captioning" but
+    # AFTER the mislabeled "compositing" tick).
+    assert [s for s in ("cutting", "captioning", "compositing", "mastering")
+            if s in seen] == ["cutting", "captioning", "compositing", "mastering"]
+
+
+def test_extraction_reports_per_segment_progress_across_cutting_range(tmp_path, monkeypatch):
+    # Finding 6: the old renderer reported progress per extracted segment;
+    # the EDL v2 pipeline ticked "cutting" once at 10% and then nothing until
+    # "compositing" at 55%, leaving the bar frozen through the longest stage
+    # (and no heartbeat -- see Finding 5c). Segment extraction must now tick
+    # multiple times, monotonically, spanning roughly 10 -> 55.
+    monkeypatch.setattr(render_plan.helpers_render, "extract_segment", lambda *a, **k: None)
+    monkeypatch.setattr(render_plan, "_concat", lambda *a, **k: tmp_path / "base.mp4")
+    monkeypatch.setattr(render_plan, "_composite", lambda *a, **k: tmp_path / "comp.mp4")
+    monkeypatch.setattr(render_plan, "_master", lambda *a, **k: None)
+    monkeypatch.setattr(render_plan, "_probe_out",
+                        lambda p: {"width": 1080, "height": 1920, "duration": 2.0})
+
+    plan = _plan(tmp_path)
+    plan["ranges"] = [
+        {"source": "main", "start": 0.0, "end": 1.0, "zoom": 1.0},
+        {"source": "main", "start": 1.0, "end": 2.0, "zoom": 1.0},
+        {"source": "main", "start": 2.0, "end": 3.0, "zoom": 1.0},
+        {"source": "main", "start": 3.0, "end": 4.0, "zoom": 1.0},
+    ]
+    plan["total_duration_s"] = 4.0
+
+    seen = []
+    render_plan.render(plan, tmp_path, tmp_path / "out.mp4", words=[],
+                       progress_cb=lambda p, s: seen.append((p, s)))
+
+    cutting_ticks = [p for p, s in seen if s == "cutting"]
+    assert len(cutting_ticks) > 1, "extraction must tick more than once across 4 segments"
+    assert cutting_ticks == sorted(cutting_ticks), "progress must be monotonic"
+    assert cutting_ticks[0] >= 10
+    assert cutting_ticks[-1] <= 55
 
 
 def test_cancel_before_extract_raises(tmp_path, monkeypatch):

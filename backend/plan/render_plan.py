@@ -6,12 +6,12 @@ cover them.
 """
 
 import json
-import subprocess
 from pathlib import Path
 
 import captions_ass
 import render as helpers_render
-import worker
+from errors import Cancelled
+from hidden_proc import run as hidden_run
 from plan import materialize, model
 
 # The old backend/render_engine.py (deleted; see the module docstring in
@@ -22,7 +22,7 @@ CLIPCUT_FPS = 30
 
 
 def _probe_out(path: Path) -> dict:
-    out = subprocess.run(
+    out = hidden_run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height", "-show_entries", "format=duration",
          "-of", "json", str(path)],
@@ -37,10 +37,24 @@ def _probe_out(path: Path) -> dict:
     }
 
 
-def _extract_all(plan, work_dir, cover, center_x, check_cancel=None):
+def _extract_all(plan, work_dir, cover, center_x, check_cancel=None, segment_done=None):
+    """Extract every range to its own segment file.
+
+    `segment_done(done, total)`, when given, is called after each segment
+    finishes so the caller can report per-segment progress -- the old
+    renderer reported progress per extracted segment; the EDL v2 pipeline
+    used to tick once at the start of this stage and then nothing until it
+    was entirely done, which also meant no heartbeat for however long the
+    longest, multi-minute stage took (the job lease is 60s). Piggybacking on
+    the same progress_cb the caller already threads through to ctx.progress
+    fixes both: the progress bar moves per segment, and each tick heartbeats
+    the job lease.
+    """
     sources = plan["sources"]
     paths = []
-    for i, r in enumerate(plan["ranges"]):
+    ranges = plan["ranges"]
+    total = len(ranges)
+    for i, r in enumerate(ranges):
         if check_cancel:
             check_cancel()
         seg = work_dir / f"seg_{i:04d}.mp4"
@@ -57,6 +71,8 @@ def _extract_all(plan, work_dir, cover, center_x, check_cancel=None):
             fps=CLIPCUT_FPS,
         )
         paths.append(seg)
+        if segment_done:
+            segment_done(i + 1, total)
     return paths
 
 
@@ -120,7 +136,7 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
 
     def check_cancel():
         if cancel_cb and cancel_cb():
-            raise worker.Cancelled()
+            raise Cancelled()
 
     project_dir = Path(project_dir)
     edit_dir = materialize.edit_dir(project_dir)
@@ -132,12 +148,23 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
     cover = aspect == "9:16"
     center_x = float((plan.get("reframe") or {}).get("center_x", 0.5))
 
-    check_cancel()
-    tick(10, "cutting")
-    segments = _extract_all(plan, work_dir, cover, center_x, check_cancel)
+    # "cutting" spans 10 -> CUTTING_END: extraction is routinely the longest
+    # stage (per-clip ffmpeg encodes), so it gets per-segment ticks instead
+    # of one flat tick at the start and nothing again until the next stage.
+    CUTTING_START, CUTTING_END = 10, 55
+
+    def segment_done(done, total):
+        if total <= 0:
+            return
+        span = CUTTING_END - CUTTING_START
+        p = CUTTING_START + int(round(span * done / total))
+        tick(min(p, CUTTING_END), "cutting")
 
     check_cancel()
-    tick(55, "compositing")
+    tick(CUTTING_START, "cutting")
+    segments = _extract_all(plan, work_dir, cover, center_x, check_cancel, segment_done)
+
+    check_cancel()
     base = _concat(segments, work_dir, edit_dir)
 
     subs_path = None
@@ -145,7 +172,7 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
     caps = plan.get("captions") or {}
     if caps.get("burn") and words:
         check_cancel()
-        tick(70, "captioning")
+        tick(60, "captioning")
         probe = _probe_out(base)
         candidate_subs_path = edit_dir / "captions.ass"
         style = captions_ass.CAPTION_STYLES.get(
@@ -170,9 +197,14 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
         if caption_count:
             subs_path = candidate_subs_path
     else:
-        tick(70, "captioning")
+        tick(60, "captioning")
 
+    # "compositing" lands on the actual composite pass (overlays + burned
+    # captions, a real ffmpeg encode) rather than on the cheap lossless
+    # concat above -- that concat used to be ticked "compositing" even
+    # though the real compositing work hadn't started yet.
     check_cancel()
+    tick(70, "compositing")
     composited = _composite(base, plan, subs_path, work_dir, edit_dir)
 
     check_cancel()
