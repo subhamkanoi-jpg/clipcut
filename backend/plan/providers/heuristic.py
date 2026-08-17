@@ -61,7 +61,7 @@ class HeuristicProvider:
             if norm in HOOK_WORDS:
                 graphics.append({
                     "text": w.get("text", "").strip(),
-                    "start_s": float(w.get("start") or 0.0),
+                    "start_s": self._source_to_output(ctx, float(w.get("start") or 0.0)),
                     "duration_s": GRAPHIC_DURATION_S,
                 })
             if len(graphics) >= MAX_HEURISTIC_GRAPHICS:
@@ -71,11 +71,33 @@ class HeuristicProvider:
 
     @staticmethod
     def _range_of(ctx: PlanContext, t: float, n_ranges: int) -> int:
-        """Which kept range does output time t fall in? Clamped to [0, n-1]."""
-        elapsed = 0.0
+        """Which kept range does SOURCE time t fall in? Clamped to [0, n-1]."""
         for i, r in enumerate(ctx.ranges):
             dur = float(r.get("end") or 0) - float(r.get("start") or 0)
             if t < float(r.get("start") or 0) + dur:
                 return i
-            elapsed += dur
         return n_ranges - 1
+
+    @staticmethod
+    def _source_to_output(ctx: PlanContext, t: float) -> float:
+        """Map a SOURCE-timeline time t to its OUTPUT-timeline (finished
+        reel) equivalent, given the kept ranges.
+
+        Walks the kept ranges accumulating output time. If t falls within
+        kept range i (r.start <= t < r.end), its output time is
+        output_time_at(ranges, i) + (t - r.start) -- equivalently, the
+        accumulated output duration of all prior ranges plus the offset into
+        this one. If t falls in a trimmed gap (or before/after all kept
+        footage), it snaps to the nearest kept boundary: the output-time end
+        of the previous kept range, or 0.0 if there is none.
+        """
+        out_t = 0.0
+        for r in ctx.ranges:
+            r_start = float(r.get("start") or 0.0)
+            r_end = float(r.get("end") or 0.0)
+            if t < r_start:
+                return max(0.0, out_t)
+            if t < r_end:
+                return out_t + (t - r_start)
+            out_t += r_end - r_start
+        return max(0.0, out_t)

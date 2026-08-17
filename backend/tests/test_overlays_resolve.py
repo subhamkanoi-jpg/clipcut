@@ -39,6 +39,8 @@ def test_failed_broll_falls_back_to_graphic(tmp_path, monkeypatch):
     ov = model.overlay("broll", 2.0, 2.4, query="laptop", source="mixkit", after_i=1)
     out = ov_mod.resolve_overlays([ov], tmp_path)
     assert out[0]["file"] and Path(out[0]["file"]).is_file()
+    # Finding 3: a degraded overlay must be surfaced, not silent.
+    assert out[0]["degraded"] is True
 
 
 def test_disabled_overlay_is_not_resolved(tmp_path):

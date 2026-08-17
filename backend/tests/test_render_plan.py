@@ -221,3 +221,41 @@ def test_composite_resolves_overlays_before_compositing(tmp_path, monkeypatch):
 
     assert seen.get("called") is True
     assert seen["overlay_files"] == [str(tmp_path / "clip.mp4")]
+
+
+def test_composite_drops_overlays_with_no_resolved_file(tmp_path, monkeypatch):
+    # Finding 2: resolve_overlays can hand back an overlay with file=None
+    # when even the graphic fallback fails. build_final_composite does
+    # Path(ov["file"]) unconditionally, so passing that overlay through
+    # would raise TypeError and fail the whole export. _composite must
+    # filter it out first.
+    from plan import overlays as ov_mod
+    from plan import model, render_plan
+
+    seen = {}
+
+    def fake_resolve(ovs, edit_dir, fetch=True):
+        out = []
+        for o in ovs:
+            if o.get("query") == "bad":
+                out.append(dict(o, file=None))
+            else:
+                out.append(dict(o, file=str(tmp_path / "good.mp4")))
+        return out
+
+    def fake_build(base, overlays, subs, out, edit_dir):
+        seen["overlay_files"] = [o.get("file") for o in overlays]
+        out.write_bytes(b"x")
+
+    monkeypatch.setattr(ov_mod, "resolve_overlays", fake_resolve)
+    monkeypatch.setattr(render_plan.helpers_render, "build_final_composite", fake_build)
+
+    (tmp_path / "base.mp4").write_bytes(b"base")
+    p = model.new_plan("p1", str(tmp_path / "source.mp4"))
+    p["overlays"] = [
+        model.overlay("broll", 1.0, 2.0, query="bad", source="mixkit", after_i=0),
+        model.overlay("broll", 3.0, 2.0, query="good", source="mixkit", after_i=1),
+    ]
+    render_plan._composite(tmp_path / "base.mp4", p, None, tmp_path, tmp_path)
+
+    assert seen["overlay_files"] == [str(tmp_path / "good.mp4")]

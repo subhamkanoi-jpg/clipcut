@@ -86,6 +86,12 @@ def _composite(base, plan, subs_path, work_dir, edit_dir):
     out = work_dir / "composite.mp4"
     enabled = [o for o in (plan.get("overlays") or []) if o.get("enabled")]
     resolved = ov_mod.resolve_overlays(enabled, edit_dir) if enabled else []
+    # An overlay can come back with file=None when even the graphic fallback
+    # fails (see plan/overlays.py::resolve_overlays); build_final_composite
+    # does Path(ov["file"]) unconditionally, so a None there would raise
+    # TypeError and fail the whole export. Drop those overlays instead --
+    # one bad overlay should not abort the batch.
+    resolved = [o for o in resolved if o.get("file")]
     helpers_render.build_final_composite(base, resolved, subs_path, out, edit_dir)
     return out
 

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
 
 from plan import brief
 from plan.providers.base import PlanContext, validate_picks
+
+log = logging.getLogger(__name__)
 
 TIMEOUT_S = 180
 
@@ -44,17 +47,25 @@ class ClaudeCliProvider:
         try:
             brief.write_brief(ctx)
             returncode = _invoke_claude(ctx)
-        except Exception:
+        except Exception as exc:
+            log.info("claude_cli.plan: exception invoking claude: %s", exc)
             return None
         if returncode != 0:
+            # Covers both a non-zero exit and _invoke_claude's -1 sentinel
+            # for a timed-out process.
+            log.info("claude_cli.plan: claude exited with code %s", returncode)
             return None
         picks_path = Path(ctx.edit_dir) / "picks.json"
         if not picks_path.is_file():
+            log.info("claude_cli.plan: picks.json not found at %s", picks_path)
             return None
         try:
             data = json.loads(picks_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            log.info("claude_cli.plan: invalid JSON in picks.json: %s", exc)
             return None
-        if validate_picks(data) != []:
+        errors = validate_picks(data)
+        if errors != []:
+            log.info("claude_cli.plan: picks.json failed schema validation: %s", errors)
             return None
         return data

@@ -13,9 +13,12 @@ graphic for that overlay alone, so one bad overlay never aborts the batch.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from plan import model
+
+log = logging.getLogger(__name__)
 
 # --- render-time resolution ---
 # Imported at module scope so tests can monkeypatch them on this module.
@@ -139,12 +142,18 @@ def resolve_overlays(overlays: list, edit_dir: Path, *, fetch: bool = True) -> l
             # this too -- if even the fallback raises, leave this overlay's
             # file as None and move on rather than aborting the batch.
             label = str(item.get("query") or item.get("text") or "B-ROLL")
+            log.info("overlay degraded to keyword-graphic fallback: kind=%s query=%r",
+                      kind, label)
+            item["degraded"] = True
             try:
                 resolved = make_keyword_graphic(label.upper()[:18], edit_dir, dur)
                 if resolved is not None and not Path(resolved).is_file():
                     resolved = None
             except Exception:
                 resolved = None
+            if resolved is None:
+                log.warning("overlay has no usable file after fallback: kind=%s query=%r",
+                             kind, label)
 
         item["file"] = str(Path(resolved).resolve()) if resolved is not None else None
         out.append(item)

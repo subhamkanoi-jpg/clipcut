@@ -49,9 +49,11 @@ def run(ctx) -> dict:
         if picks is not None:
             used = provider.name
             break
-    if picks is None:
-        picks = HeuristicProvider().plan(pctx)
-        used = "heuristic"
+    # _provider_chain() always ends with a HeuristicProvider, whose .plan()
+    # never returns None, so the loop above guarantees picks is set by the
+    # time it exits -- there is no reachable case where picks is still None
+    # here.
+    assert picks is not None
 
     locked = []
     if (ctx.payload or {}).get("regenerate"):

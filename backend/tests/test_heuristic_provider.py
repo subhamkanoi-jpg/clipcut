@@ -2,6 +2,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
 
@@ -54,3 +56,23 @@ def test_empty_transcript_is_valid_and_empty(tmp_path):
 
 def test_name_is_heuristic():
     assert HeuristicProvider().name == "heuristic"
+
+
+def test_graphic_start_s_uses_output_time_not_source_time(tmp_path):
+    # Finding 1: the first 2s of source footage are trimmed out (the kept
+    # range starts at source t=2.0), so a hook word at source t=3.0 should
+    # land at OUTPUT t=1.0 (3.0 - 2.0), not at its raw source timestamp.
+    words = [
+        {"text": "This", "start": 2.5, "end": 2.8, "type": "word"},
+        {"text": "everything", "start": 3.0, "end": 3.6, "type": "word"},
+    ]
+    text = " ".join(w["text"] for w in words)
+    ranges = [{"source": "main", "start": 2.0, "end": 8.0}]
+    ctx = base.PlanContext(edit_dir=tmp_path, words=words, text=text,
+                           ranges=ranges, total_s=6.0)
+
+    picks = HeuristicProvider().plan(ctx)
+
+    graphics = [g for g in picks["graphics"] if g["text"].lower() == "everything"]
+    assert graphics, "expected 'everything' hook word to produce a graphic"
+    assert graphics[0]["start_s"] == pytest.approx(1.0)
