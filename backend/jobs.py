@@ -83,21 +83,68 @@ def finish(db, job_id: str, result: dict | None = None) -> None:
     }})
 
 
-def fail(db, job_id: str, error: str) -> None:
-    db.jobs.update_one({"id": job_id}, {"$set": {
-        "status": "error",
-        "stage": "failed",
-        "error": str(error)[:2000],
-        "finished_at": _now(),
+# Every terminal job kind carries a matching project sub-document that must
+# not be left showing "processing"/an in-flight stage once the job itself is
+# error/cancelled -- that's the exact failure mode this queue was built to
+# prevent. Rather than have every call site that can fail or cancel a job
+# (worker.run_once's "no handler" branch, its generic exception handler,
+# reconcile_stale's "exceeded max attempts" branch, ...) remember to also
+# reconcile the project, `fail()` and `cancel()` below do it themselves, so
+# it is structurally true for every path instead of duplicated per caller.
+def _reconcile_transcribe_project(db, project_id: str, status: str, error: str | None) -> None:
+    db.projects.update_one({"id": project_id}, {"$set": {
+        "status": status, "error": error,
     }})
+
+
+def _reconcile_export_project(db, project_id: str, status: str, error: str | None) -> None:
+    db.projects.update_one({"id": project_id}, {"$set": {
+        "export": {
+            "status": status, "progress": 0, "error": error,
+            "stage": "cancelled" if status == "cancelled" else "failed",
+        },
+    }})
+
+
+# kind -> function(db, project_id, status, error). Add an entry here whenever
+# a new job kind gets its own project sub-document shape.
+PROJECT_RECONCILERS = {
+    "transcribe": _reconcile_transcribe_project,
+    "export": _reconcile_export_project,
+}
+
+
+def _reconcile_project(db, job_doc: dict | None, status: str, error: str | None) -> None:
+    if not job_doc:
+        return
+    reconciler = PROJECT_RECONCILERS.get(job_doc.get("kind"))
+    if reconciler:
+        reconciler(db, job_doc["project_id"], status, error)
+
+
+def fail(db, job_id: str, error: str) -> None:
+    doc = db.jobs.find_one_and_update(
+        {"id": job_id},
+        {"$set": {
+            "status": "error",
+            "stage": "failed",
+            "error": str(error)[:2000],
+            "finished_at": _now(),
+        }},
+    )
+    _reconcile_project(db, doc, "error", str(error)[:500])
 
 
 def cancel(db, job_id: str) -> None:
-    db.jobs.update_one({"id": job_id}, {"$set": {
-        "status": "cancelled",
-        "stage": "cancelled",
-        "finished_at": _now(),
-    }})
+    doc = db.jobs.find_one_and_update(
+        {"id": job_id},
+        {"$set": {
+            "status": "cancelled",
+            "stage": "cancelled",
+            "finished_at": _now(),
+        }},
+    )
+    _reconcile_project(db, doc, "cancelled", None)
 
 
 def request_cancel(db, job_id: str) -> None:
@@ -112,7 +159,12 @@ def is_cancelled(db, job_id: str) -> bool:
 def reconcile_stale(db) -> int:
     """Requeue processing jobs whose lease expired. Fail those past max attempts.
 
-    Called on worker boot. Returns how many were requeued.
+    Called on worker boot, and periodically from the poll loop (see
+    worker.maybe_reconcile) so a job whose lease was still valid when its
+    worker died doesn't sit in "processing" until the next restart. Jobs
+    failed here go through fail() above, which also reconciles the project
+    document so it can never be left stranded showing "processing" either.
+    Returns how many were requeued.
     """
     now = _now()
     requeued = 0

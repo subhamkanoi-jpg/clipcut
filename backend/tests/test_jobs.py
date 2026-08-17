@@ -133,3 +133,84 @@ def test_cancel_sets_terminal_status(db):
     assert doc["status"] == "cancelled"
     assert doc["stage"] == "cancelled"
     assert doc["finished_at"] is not None
+
+
+# Finding 5b: every path that fails or cancels a job OUTSIDE a handler's own
+# try/except (no handler registered, reconcile_stale's exceeded-max-attempts
+# branch, an exception raised before a handler's own try) used to leave the
+# matching project document stranded showing "processing" -- exactly the
+# failure mode the queue exists to prevent. fail()/cancel() now reconcile the
+# project themselves so this is true structurally, for any caller, instead
+# of being duplicated (and inevitably missed) per handler.
+
+
+def test_fail_reconciles_export_project_out_of_processing(db):
+    db.projects.insert_one({"id": "p1", "export": {
+        "status": "processing", "progress": 40, "error": None, "stage": "cutting",
+    }})
+    jid = jobs_mod.enqueue(db, "p1", "export")
+    jobs_mod.fail(db, jid, "ffmpeg exited 1")
+
+    exp = db.projects.find_one({"id": "p1"})["export"]
+    assert exp["status"] == "error"
+    assert exp["error"] == "ffmpeg exited 1"
+    assert exp["stage"] == "failed"
+    assert exp["progress"] == 0
+
+
+def test_fail_reconciles_transcribe_project_out_of_processing(db):
+    db.projects.insert_one({"id": "p2", "status": "transcribing"})
+    jid = jobs_mod.enqueue(db, "p2", "transcribe")
+    jobs_mod.fail(db, jid, "Scribe returned 401")
+
+    doc = db.projects.find_one({"id": "p2"})
+    assert doc["status"] == "error"
+    assert doc["error"] == "Scribe returned 401"
+
+
+def test_fail_ignores_unknown_kind_project_shape(db):
+    # A kind with no registered reconciler (e.g. a not-yet-deployed "plan"
+    # kind) must not blow up -- there's no project schema to reconcile
+    # against, so this is a safe no-op rather than an error.
+    db.projects.insert_one({"id": "p3"})
+    jid = jobs_mod.enqueue(db, "p3", "plan")
+    jobs_mod.fail(db, jid, "boom")
+    assert db.jobs.find_one({"id": jid})["status"] == "error"
+    doc = db.projects.find_one({"id": "p3"}, {"_id": 0})
+    assert doc == {"id": "p3"}
+
+
+def test_cancel_reconciles_export_project_out_of_processing(db):
+    db.projects.insert_one({"id": "p4", "export": {
+        "status": "processing", "progress": 55, "error": None, "stage": "compositing",
+    }})
+    jid = jobs_mod.enqueue(db, "p4", "export")
+    jobs_mod.cancel(db, jid)
+
+    exp = db.projects.find_one({"id": "p4"})["export"]
+    assert exp["status"] == "cancelled"
+    assert exp["stage"] == "cancelled"
+    assert exp["progress"] == 0
+    assert exp["error"] is None
+
+
+def test_reconcile_stale_exceeded_attempts_reconciles_project(db):
+    # This is the second of the two gap paths named in Finding 5b: a job
+    # that exhausts its retries in reconcile_stale (never touching a
+    # handler's own try/except at all) must still pull its project out of
+    # "processing".
+    db.projects.insert_one({"id": "p5", "export": {
+        "status": "processing", "progress": 20, "error": None, "stage": "cutting",
+    }})
+    jid = jobs_mod.enqueue(db, "p5", "export")
+    db.jobs.update_one({"id": jid}, {"$set": {
+        "status": "processing",
+        "attempts": 3,
+        "lease_expires_at": datetime.now(timezone.utc) - timedelta(seconds=5),
+    }})
+
+    jobs_mod.reconcile_stale(db)
+
+    exp = db.projects.find_one({"id": "p5"})["export"]
+    assert exp["status"] == "error"
+    assert "attempts" in exp["error"]
