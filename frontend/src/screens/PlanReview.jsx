@@ -48,30 +48,39 @@ export default function PlanReview({ project, onRegenerate, onRender, onOverlayP
             ))}
           </div>
 
-          {/* Ranges Lane */}
+          {/* Ranges Lane. Kept ranges are laid end-to-end on the OUTPUT
+              timeline (the reel is the concatenation of kept ranges), so each
+              range's position is the cumulative output duration before it — NOT
+              its source-video start. This keeps the lane on the same output axis
+              as the overlays above/below. */}
           <div className="relative h-12 bg-zinc-950 border border-zinc-800 rounded flex items-center">
             <span className="absolute -left-16 font-mono text-[10px] uppercase text-zinc-500 w-14 text-right pr-2">Ranges</span>
-            {ranges.map((r, i) => {
-              const startPct = (r.start / totalS) * 100;
-              const widthPct = ((r.end - r.start) / totalS) * 100;
-              return (
-                <div
-                  key={i}
-                  className="absolute top-1 bottom-1 bg-zinc-800 border border-zinc-700 rounded text-[9px] text-zinc-300 p-1 truncate cursor-help group"
-                  style={{ left: `${startPct}%`, width: `${widthPct}%` }}
-                >
-                  <span className="block truncate">{r.reason || "Kept"}</span>
-                  {r.zoom && <span className="text-primary font-mono text-[8px]">{r.zoom}x</span>}
-                  
-                  {/* Tooltip */}
-                  <div className="hidden group-hover:block absolute bottom-full mb-1 left-0 bg-black border border-zinc-700 p-2 rounded z-10 w-48 shadow-lg whitespace-normal break-words text-xs">
-                    <p className="text-primary font-mono mb-1">{r.start.toFixed(1)}s - {r.end.toFixed(1)}s</p>
-                    {r.reason && <p className="text-zinc-300">Reason: {r.reason}</p>}
-                    {r.variation && <p className="text-zinc-400 mt-1">Move: {r.variation}</p>}
+            {(() => {
+              let cursor = 0;
+              return ranges.map((r, i) => {
+                const dur = Math.max(0, (r.end ?? 0) - (r.start ?? 0));
+                const startPct = (cursor / totalS) * 100;
+                const widthPct = (dur / totalS) * 100;
+                cursor += dur;
+                return (
+                  <div
+                    key={i}
+                    className="absolute top-1 bottom-1 bg-zinc-800 border border-zinc-700 rounded text-[9px] text-zinc-300 p-1 truncate cursor-help group"
+                    style={{ left: `${startPct}%`, width: `${widthPct}%` }}
+                  >
+                    <span className="block truncate">{r.reason || "Kept"}</span>
+                    {r.zoom > 1.01 && <span className="text-primary font-mono text-[8px]">{r.zoom}x</span>}
+
+                    {/* Tooltip shows the ORIGINAL source times for context. */}
+                    <div className="hidden group-hover:block absolute bottom-full mb-1 left-0 bg-black border border-zinc-700 p-2 rounded z-10 w-48 shadow-lg whitespace-normal break-words text-xs">
+                      <p className="text-primary font-mono mb-1">source {(r.start ?? 0).toFixed(1)}s - {(r.end ?? 0).toFixed(1)}s</p>
+                      {r.reason && <p className="text-zinc-300">Reason: {r.reason}</p>}
+                      {r.variation && <p className="text-zinc-400 mt-1">Move: {r.variation}</p>}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              });
+            })()}
           </div>
 
           {/* Overlays Lane */}
@@ -117,24 +126,33 @@ export default function PlanReview({ project, onRegenerate, onRender, onOverlayP
                   <div className="px-2 py-1 flex-1 flex flex-col justify-center">
                     {isLoading ? (
                       <Loader2 className="w-3 h-3 animate-spin text-zinc-500 mx-auto" />
+                    ) : ov.kind === "graphic" ? (
+                      // Keyword graphics carry `text`, not a swappable query.
+                      <span
+                        className="text-[10px] font-bold text-primary/90 truncate"
+                        title="Keyword graphic"
+                      >
+                        {ov.text || ""}
+                      </span>
                     ) : (
-                      <>
-                        <input 
-                          type="text" 
-                          defaultValue={ov.query} 
-                          className="bg-transparent border-none text-[10px] font-medium text-white w-full outline-none focus:text-primary"
-                          onBlur={(e) => {
-                            if (e.target.value !== ov.query) {
-                              handlePatch(ov.id, { query: e.target.value });
-                            }
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.target.blur();
-                            }
-                          }}
-                        />
-                      </>
+                      // B-roll / stills: the query is editable; changing it
+                      // re-fetches the media on the next render.
+                      <input
+                        type="text"
+                        defaultValue={ov.query || ""}
+                        className="bg-transparent border-none text-[10px] font-medium text-white w-full outline-none focus:text-primary"
+                        title="Edit the search query and blur to swap the clip"
+                        onBlur={(e) => {
+                          if (e.target.value.trim() && e.target.value !== ov.query) {
+                            handlePatch(ov.id, { query: e.target.value.trim() });
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.target.blur();
+                          }
+                        }}
+                      />
                     )}
                   </div>
                 </div>

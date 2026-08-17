@@ -105,3 +105,72 @@ def test_get_plan_404_when_no_plan(db, tc):
 def test_get_plan_404_when_project_missing(db, tc):
     resp = tc.get("/api/projects/ghost/plan")
     assert resp.status_code == 404
+
+
+# --- PATCH /projects/{pid}/plan/overlays/{oid} (added in the b2 review UI) ---
+
+def _plan_with_overlay(**ov_extra):
+    ov = {
+        "id": "ov1", "kind": "broll", "start_in_output": 1.0, "duration": 2.0,
+        "file": "/tmp/broll.mp4", "query": "laptop", "source": "mixkit",
+        "enabled": True, "locked": False,
+    }
+    ov.update(ov_extra)
+    return {"version": 2, "overlays": [ov], "ranges": [], "total_duration_s": 10.0}
+
+
+def test_patch_overlay_toggles_enabled(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    resp = tc.patch("/api/projects/p1/plan/overlays/ov1", json={"enabled": False})
+    assert resp.status_code == 200
+    stored = db.projects.find_one({"id": "p1"})["plan"]["overlays"][0]
+    assert stored["enabled"] is False
+
+
+def test_patch_overlay_toggles_locked(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    resp = tc.patch("/api/projects/p1/plan/overlays/ov1", json={"locked": True})
+    assert resp.status_code == 200
+    assert db.projects.find_one({"id": "p1"})["plan"]["overlays"][0]["locked"] is True
+
+
+def test_patch_overlay_query_change_clears_file(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    resp = tc.patch("/api/projects/p1/plan/overlays/ov1", json={"query": "desk"})
+    assert resp.status_code == 200
+    stored = db.projects.find_one({"id": "p1"})["plan"]["overlays"][0]
+    assert stored["query"] == "desk"
+    assert stored["file"] is None  # cleared so the next render re-fetches
+
+
+def test_patch_overlay_same_query_keeps_file(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    resp = tc.patch("/api/projects/p1/plan/overlays/ov1", json={"query": "laptop"})
+    assert resp.status_code == 200
+    assert db.projects.find_one({"id": "p1"})["plan"]["overlays"][0]["file"] == "/tmp/broll.mp4"
+
+
+def test_patch_overlay_leaves_other_fields_untouched(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    tc.patch("/api/projects/p1/plan/overlays/ov1", json={"enabled": False})
+    stored = db.projects.find_one({"id": "p1"})["plan"]["overlays"][0]
+    assert stored["locked"] is False
+    assert stored["start_in_output"] == 1.0
+    assert stored["query"] == "laptop"
+
+
+def test_patch_overlay_404_when_overlay_missing(db, tc):
+    _project(db, "p1", plan=_plan_with_overlay(), plan_status="ready")
+    resp = tc.patch("/api/projects/p1/plan/overlays/nope", json={"enabled": False})
+    assert resp.status_code == 404
+
+
+def test_patch_overlay_404_when_no_plan(db, tc):
+    _project(db, "p1")
+    resp = tc.patch("/api/projects/p1/plan/overlays/ov1", json={"enabled": False})
+    assert resp.status_code == 404
+
+
+def test_patch_overlay_404_when_project_missing(db, tc):
+    resp = tc.patch("/api/projects/ghost/plan/overlays/ov1", json={"enabled": False})
+    assert resp.status_code == 404
