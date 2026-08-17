@@ -1,6 +1,6 @@
 import axios from "axios";
 
-export const API = "/api";
+export const API = process.env.REACT_APP_API_URL || "/api";
 const STORAGE_KEY = "clipcut-project-access";
 
 function readAccess() {
