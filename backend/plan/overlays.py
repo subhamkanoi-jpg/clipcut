@@ -1,8 +1,14 @@
 """Assemble picks into EDL v2 overlays, and resolve their media at render time.
 
-Planning produces overlays with file=None and full review metadata
-(enabled/locked/query/source). Resolution (Task 6) fetches the media just
-before compositing.
+`overlays_from_picks` turns a picks dict into EDL v2 overlays with file=None
+and full review metadata (enabled/locked/query/source), preserving any
+already-locked overlays. `resolve_overlays` walks those overlays at render
+time and fetches each enabled one's media to a local file: broll via
+`resolve_broll_file` (converting any still-image result to an mp4 clip via
+`photo_to_clip`), still via `match_photo` + `photo_to_clip`, graphic via
+`make_keyword_graphic`. Resolution is fault-isolated per overlay -- if the
+primary strategy raises or yields nothing, it falls back to a keyword
+graphic for that overlay alone, so one bad overlay never aborts the batch.
 """
 
 from __future__ import annotations
@@ -74,7 +80,14 @@ def _broll_dir(edit_dir: Path) -> Path:
 
 
 def resolve_overlays(overlays: list, edit_dir: Path, *, fetch: bool = True) -> list:
-    """Return overlays with each enabled one's media resolved to a local file."""
+    """Return overlays with each enabled one's media resolved to a local file.
+
+    Fault-isolated per overlay: if the primary acquisition strategy raises
+    or yields no usable file, that overlay degrades to a keyword-graphic
+    fallback instead of propagating the exception and aborting the rest of
+    the batch. Only if the fallback itself fails is the overlay's file left
+    as None; every other enabled overlay still gets resolved.
+    """
     edit_dir = Path(edit_dir)
     out: list = []
     for ov in overlays:
@@ -90,16 +103,29 @@ def resolve_overlays(overlays: list, edit_dir: Path, *, fetch: bool = True) -> l
         dur = float(item.get("duration") or 2.0)
         resolved: Path | None = None
 
-        if kind == "graphic":
-            resolved = make_keyword_graphic(str(item.get("text") or "NOW"), edit_dir, dur)
-        elif kind == "broll" and fetch:
-            resolved = resolve_broll_file({"query": item.get("query")}, _broll_dir(edit_dir))
-        elif kind == "still" and fetch:
-            photo = match_photo(str(item.get("query") or ""))
-            src = Path(str(photo.get("file"))) if photo and photo.get("file") else None
-            if src and src.is_file():
-                clip = _broll_dir(edit_dir) / f"{src.stem}.mp4"
-                resolved = photo_to_clip(src, clip, dur)
+        try:
+            if kind == "graphic":
+                resolved = make_keyword_graphic(str(item.get("text") or "NOW"), edit_dir, dur)
+            elif kind == "broll" and fetch:
+                got = resolve_broll_file({"query": item.get("query")}, _broll_dir(edit_dir))
+                if got is not None:
+                    got = Path(got)
+                    if got.is_file() and got.suffix.lower() in IMAGE_EXTS:
+                        # resolve_broll_file can hand back a still (Pexels
+                        # photo catalog / API hit) instead of a video; the
+                        # compositor treats every overlay file as a video
+                        # input, so convert it to an mp4 clip first.
+                        clip = _broll_dir(edit_dir) / f"{got.stem}.mp4"
+                        got = photo_to_clip(got, clip, dur)
+                resolved = got
+            elif kind == "still" and fetch:
+                photo = match_photo(str(item.get("query") or ""))
+                src = Path(str(photo.get("file"))) if photo and photo.get("file") else None
+                if src and src.is_file():
+                    clip = _broll_dir(edit_dir) / f"{src.stem}.mp4"
+                    resolved = photo_to_clip(src, clip, dur)
+        except Exception:
+            resolved = None
 
         is_file = False
         if resolved is not None:
@@ -109,10 +135,17 @@ def resolve_overlays(overlays: list, edit_dir: Path, *, fetch: bool = True) -> l
                 pass
 
         if not is_file:
-            # Never drop an overlay: fall back to a keyword graphic.
+            # Never drop an overlay: fall back to a keyword graphic. Guard
+            # this too -- if even the fallback raises, leave this overlay's
+            # file as None and move on rather than aborting the batch.
             label = str(item.get("query") or item.get("text") or "B-ROLL")
-            resolved = make_keyword_graphic(label.upper()[:18], edit_dir, dur)
+            try:
+                resolved = make_keyword_graphic(label.upper()[:18], edit_dir, dur)
+                if resolved is not None and not Path(resolved).is_file():
+                    resolved = None
+            except Exception:
+                resolved = None
 
-        item["file"] = str(Path(resolved).resolve())
+        item["file"] = str(Path(resolved).resolve()) if resolved is not None else None
         out.append(item)
     return out

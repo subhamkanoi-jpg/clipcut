@@ -57,3 +57,54 @@ def test_still_matches_photo_then_ken_burns(tmp_path, monkeypatch):
     ov = model.overlay("still", 1.0, 2.0, query="desk", source="pexels", after_i=0)
     out = ov_mod.resolve_overlays([ov], tmp_path)
     assert out[0]["file"] and Path(out[0]["file"]).is_file()
+
+
+def test_broll_image_result_is_converted_to_clip(tmp_path, monkeypatch):
+    photo = tmp_path / "beach.jpg"
+    photo.write_bytes(b"jpeg")
+    calls = []
+
+    def _fake_photo_to_clip(p, dest, dur):
+        calls.append(Path(p))
+        dest.write_bytes(b"clip")
+        return dest
+
+    monkeypatch.setattr(ov_mod, "resolve_broll_file", lambda vis, dest: photo)
+    monkeypatch.setattr(ov_mod, "photo_to_clip", _fake_photo_to_clip)
+    ov = model.overlay("broll", 2.0, 2.4, query="beach", source="mixkit", after_i=1)
+    out = ov_mod.resolve_overlays([ov], tmp_path)
+    result = Path(out[0]["file"])
+    assert result.suffix == ".mp4"
+    assert result.is_file()
+    assert calls and calls[0] == photo
+
+
+def test_helper_exception_falls_back_to_graphic(tmp_path, monkeypatch):
+    def _raise(vis, dest):
+        raise RuntimeError("network exploded")
+
+    monkeypatch.setattr(ov_mod, "resolve_broll_file", _raise)
+    monkeypatch.setattr(ov_mod, "make_keyword_graphic",
+                        lambda text, ed, dur: _graphic_clip(ed, text, dur))
+    ov = model.overlay("broll", 2.0, 2.4, query="laptop", source="mixkit", after_i=1)
+    out = ov_mod.resolve_overlays([ov], tmp_path)
+    assert out[0]["file"] and Path(out[0]["file"]).is_file()
+
+
+def test_one_bad_overlay_does_not_abort_the_batch(tmp_path, monkeypatch):
+    good = tmp_path / "good.mp4"
+    good.write_bytes(b"video")
+
+    def _resolve_broll(vis, dest):
+        if vis.get("query") == "bad":
+            raise RuntimeError("boom")
+        return good
+
+    monkeypatch.setattr(ov_mod, "resolve_broll_file", _resolve_broll)
+    monkeypatch.setattr(ov_mod, "make_keyword_graphic",
+                        lambda text, ed, dur: _graphic_clip(ed, text, dur))
+    ov_bad = model.overlay("broll", 0.0, 2.0, query="bad", source="mixkit", after_i=0)
+    ov_good = model.overlay("broll", 2.0, 2.0, query="good", source="mixkit", after_i=1)
+    out = ov_mod.resolve_overlays([ov_bad, ov_good], tmp_path)
+    assert out[0]["file"] and Path(out[0]["file"]).is_file()
+    assert out[1]["file"] and Path(out[1]["file"]).is_file()
