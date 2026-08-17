@@ -48,7 +48,8 @@ export const exportVideoUrl = (pid, bust) => mediaUrl(pid, "export/video", bust)
 export const downloadUrl = (pid) => mediaUrl(pid, "export/download");
 export const thumbUrl = (pid) => mediaUrl(pid, "thumbnail");
 
-const CHUNK_SIZE = 5 * 1024 * 1024;
+// Stay below Vercel Function request body limits, including multipart overhead.
+const CHUNK_SIZE = 4 * 1024 * 1024;
 
 export async function uploadVideo(file, onProgress) {
   const { data } = await api.post("/projects/upload/init", { filename: file.name, size: file.size });

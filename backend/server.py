@@ -157,7 +157,7 @@ def upload_chunk(pid: str, request: Request, index: int = Form(...), chunk: Uplo
     get_project(pid, request)
     if index < 0 or index > 1000:
         raise HTTPException(400, "invalid chunk index")
-    data = chunk.file.read(6 * 1024 * 1024)
+    data = chunk.file.read(4 * 1024 * 1024)
     blob_put(f"clipcut/{pid}/chunks/{index:06d}.part", data, "application/octet-stream")
     return {"ok": True, "index": index}
 
@@ -165,7 +165,8 @@ def upload_chunk(pid: str, request: Request, index: int = Form(...), chunk: Uplo
 @api.post("/projects/{pid}/upload/complete")
 def complete_upload(pid: str, request: Request):
     doc = get_project(pid, request)
-    total = (doc["size"] + 5 * 1024 * 1024 - 1) // (5 * 1024 * 1024)
+    chunk_size = 4 * 1024 * 1024
+    total = (doc["size"] + chunk_size - 1) // chunk_size
     ext = Path(doc["filename"]).suffix.lower() or ".mp4"
     with tempfile.TemporaryDirectory() as tmp:
         source = Path(tmp) / f"source{ext}"
