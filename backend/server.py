@@ -391,6 +391,41 @@ def get_plan(pid: str):
             "status": doc.get("plan_status")}
 
 
+class OverlayPatchBody(BaseModel):
+    enabled: bool | None = None
+    locked: bool | None = None
+    query: str | None = None
+
+
+@api.patch("/projects/{pid}/plan/overlays/{oid}")
+def patch_overlay(pid: str, oid: str, body: OverlayPatchBody):
+    doc = get_project_or_404(pid)
+    plan = doc.get("plan")
+    if not plan:
+        raise HTTPException(404, "no plan yet")
+    
+    overlays = plan.get("overlays", [])
+    target = None
+    for ov in overlays:
+        if ov.get("id") == oid:
+            target = ov
+            break
+            
+    if not target:
+        raise HTTPException(404, "overlay not found")
+
+    if body.enabled is not None:
+        target["enabled"] = body.enabled
+    if body.locked is not None:
+        target["locked"] = body.locked
+    if body.query is not None and body.query != target.get("query"):
+        target["query"] = body.query
+        target["file"] = None
+        
+    projects.update_one({"id": pid}, {"$set": {"plan.overlays": overlays}})
+    return {"ok": True, "overlay": target}
+
+
 @api.get("/jobs/{jid}")
 def get_job(jid: str):
     doc = db.jobs.find_one({"id": jid}, {"_id": 0})

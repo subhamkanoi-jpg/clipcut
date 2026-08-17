@@ -7,6 +7,7 @@ import {
 import { api, uploadVideo, exportVideoUrl, downloadUrl, sleep } from "../api";
 import { CAPTION_STYLES, formatTime } from "../lib/captions";
 import ProjectLibrary from "../components/ProjectLibrary";
+import PlanReview from "./PlanReview";
 
 const STAGE_LABEL = {
   reframing: "Locating the speaker for vertical reframe",
@@ -107,14 +108,40 @@ export default function ReelStudio({ onOpenEditor }) {
         setPhase("transcribing");
         const ready = await pollProject(pid, (d) => d.status === "ready");
         setProject(ready);
-        await generate(pid);
+        
+        setPhase("planning");
+        const planned = await pollProject(pid, (d) => d.plan_status === "ready");
+        setProject(planned);
+        
+        setPhase("reviewing");
       } catch (e) {
         toast.error(e?.response?.data?.detail || e.message || "Something went wrong");
         setPhase("idle");
       }
     },
-    [generate, pollProject]
+    [pollProject]
   );
+
+  const handleRegeneratePlan = useCallback(async () => {
+    if (!project) return;
+    setPhase("planning");
+    await api.post(`/projects/${project.id}/plan`, { regenerate: true });
+    try {
+      const planned = await pollProject(project.id, (d) => d.plan_status === "ready");
+      setProject(planned);
+      setPhase("reviewing");
+    } catch (e) {
+      toast.error(e.message || "Planning failed");
+      setPhase("idle");
+    }
+  }, [project, pollProject]);
+
+  const handleOverlayPatch = useCallback(async (oid, patch) => {
+    if (!project) return;
+    await api.patch(`/projects/${project.id}/plan/overlays/${oid}`, patch);
+    const { data } = await api.get(`/projects/${project.id}`);
+    setProject(data);
+  }, [project]);
 
   const openLibraryItem = useCallback(
     async (p) => {
@@ -138,7 +165,7 @@ export default function ReelStudio({ onOpenEditor }) {
     [onOpenEditor]
   );
 
-  const busy = ["uploading", "transcribing", "rendering"].includes(phase);
+  const busy = ["uploading", "transcribing", "planning", "rendering"].includes(phase);
   const meta = exportState?.meta;
 
   return (
@@ -248,8 +275,16 @@ export default function ReelStudio({ onOpenEditor }) {
                 detail={phase === "transcribing" ? "word timestamps" : ""}
               />
               <Step
+                testId="step-plan"
+                label="Analyzing edit plan"
+                state={
+                  phase === "planning" ? "active" : ["uploading", "transcribing"].includes(phase) ? "idle" : "done"
+                }
+                detail={phase === "planning" ? "AI cutting & b-roll" : ""}
+              />
+              <Step
                 testId="step-render"
-                label="Auto-cut, cinematic zooms, karaoke captions"
+                label="Rendering reel"
                 state={phase === "rendering" ? "active" : "idle"}
                 detail={
                   phase === "rendering"
@@ -268,6 +303,15 @@ export default function ReelStudio({ onOpenEditor }) {
               </div>
             )}
           </div>
+        )}
+
+        {phase === "reviewing" && project && (
+          <PlanReview 
+            project={project}
+            onRegenerate={handleRegeneratePlan}
+            onRender={() => generate(project.id)}
+            onOverlayPatch={handleOverlayPatch}
+          />
         )}
 
         {phase === "done" && project && (
