@@ -78,7 +78,8 @@ credentials.json
 backend/data/
 backend/test_output.txt
 
-# ffmpeg-generated test fixture (regenerate with the command in Task 12 of
-# docs/superpowers/plans/2026-08-17-clipcut-foundation.md); the parity test
-# skips cleanly when this is absent.
-backend/tests/fixtures/parity_src.mp4
+# backend/tests/fixtures/parity_src.mp4 is INTENTIONALLY tracked (not
+# ignored) — it's the fixture for backend/tests/test_render_parity.py, a
+# real end-to-end render test. It was gitignored before, which made that
+# test skip on every clean checkout; regenerate it with the command in
+# backend/tests/fixtures/README.md if it ever needs to change.
