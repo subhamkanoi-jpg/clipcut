@@ -1,0 +1,10 @@
+{
+  "name": "ClipCut — AI Video Editor",
+  "short_name": "ClipCut",
+  "description": "Turn talking-head videos into cinematic social reels.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#dfff00",
+  "icons": []
+}

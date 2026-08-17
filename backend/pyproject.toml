@@ -1,0 +1,14 @@
+[project]
+name = "clipcut-backend"
+version = "1.0.0"
+description = "Hosted ClipCut video processing API"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi[standard]>=0.128.1",
+  "psycopg[binary]>=3.2.9",
+  "python-multipart>=0.0.20",
+  "requests>=2.32.0",
+  "vercel>=0.5.0",
+  "opencv-python-headless>=4.11.0.86",
+  "numpy>=2.2.0",
+]

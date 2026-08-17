@@ -37,7 +37,7 @@ export default function ReelStudio({ onOpenEditor }) {
   const stopped = useRef(false);
 
   useEffect(() => {
-    api.get("/cloudinary/status").then(({ data }) => setCloud(data)).catch(() => {});
+    api.get("/storage/status").then(({ data }) => setCloud(data)).catch(() => {});
     return () => {
       stopped.current = true;
     };
@@ -140,8 +140,8 @@ export default function ReelStudio({ onOpenEditor }) {
   const meta = exportState?.meta;
 
   return (
-    <div className="h-full w-full flex overflow-hidden" data-testid="reel-studio">
-      <aside className="w-72 shrink-0 bg-[#09090b] border-r border-zinc-800/50 p-6 flex flex-col gap-6 overflow-y-auto">
+    <div className="min-h-dvh w-full flex flex-col md:h-full md:flex-row md:overflow-hidden" data-testid="reel-studio">
+      <aside className="w-full shrink-0 bg-[#09090b] border-b border-zinc-800/50 p-4 flex flex-col gap-5 md:w-72 md:border-b-0 md:border-r md:p-6 md:gap-6 md:overflow-y-auto">
         <div className="flex items-center gap-2">
           <Clapperboard className="w-5 h-5 text-primary" />
           <span className="font-heading text-xl font-bold tracking-tight">ClipCut</span>
@@ -158,20 +158,20 @@ export default function ReelStudio({ onOpenEditor }) {
 
         <div className="mt-auto border border-zinc-800 rounded-lg p-3" data-testid="cloud-status">
           <div className="flex items-center gap-2">
-            <Cloud className={`w-3.5 h-3.5 ${cloud.enabled ? "text-primary" : "text-zinc-600"}`} />
+            <Cloud className={`w-3.5 h-3.5 ${cloud.blob ? "text-primary" : "text-zinc-600"}`} />
             <p className="font-mono text-[10px] uppercase tracking-wider text-zinc-400">
-              Cloudinary
+              Vercel Cloud
             </p>
           </div>
           <p className="text-[10px] text-zinc-600 mt-1">
-            {cloud.enabled
-              ? `${cloud.cloud_name} · 9:16 g_auto reframe + CDN delivery`
-              : "Add CLOUDINARY_CLOUD_NAME to enable cloud reframe + CDN"}
+            {cloud.blob
+              ? "Private Blob media · Neon project storage"
+              : "Checking secure cloud storage…"}
           </p>
         </div>
       </aside>
 
-      <main className="flex-1 bg-black relative flex flex-col p-10 overflow-y-auto min-w-0">
+      <main className="flex-1 bg-black relative flex flex-col p-4 sm:p-6 md:p-10 md:overflow-y-auto min-w-0">
         {phase === "idle" && (
           <div className="w-full max-w-3xl fade-up">
             <h1 className="font-heading text-4xl sm:text-5xl tracking-tighter font-bold">

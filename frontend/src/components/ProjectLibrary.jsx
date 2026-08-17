@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Film, Trash2, Sparkles, Clock3 } from "lucide-react";
-import { api, thumbUrl } from "../api";
+import { api, forgetProject, thumbUrl } from "../api";
 import { formatTime } from "../lib/captions";
 
 export default function ProjectLibrary({ currentId, onOpen, refreshKey, compact = false }) {
@@ -23,6 +23,7 @@ export default function ProjectLibrary({ currentId, onOpen, refreshKey, compact 
     setBusy(pid);
     try {
       await api.delete(`/projects/${pid}`);
+      forgetProject(pid);
       setItems((prev) => prev.filter((p) => p.id !== pid));
     } finally {
       setBusy(null);

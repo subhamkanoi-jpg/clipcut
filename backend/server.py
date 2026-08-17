@@ -1,119 +1,117 @@
+import hashlib
+import json
+import logging
 import os
 import re
 import shutil
 import subprocess
-import threading
+import tempfile
 import uuid
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-ROOT = Path(__file__).parent
-load_dotenv(ROOT / ".env")
-
-from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from pymongo import MongoClient
+from psycopg import connect
+from psycopg.rows import dict_row
+from vercel.blob import BlobClient
 
-import cloudinary_svc
 import cuts as cuts_mod
 import render_engine
 import transcription
 import zooms
 
-client = MongoClient(os.environ["MONGO_URL"])
-db = client[os.environ["DB_NAME"]]
-projects = db.projects
-
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-app = FastAPI(title="Captions Editor API")
-api = APIRouter(prefix="/api")
+app = FastAPI(title="ClipCut Cloud API")
+api = APIRouter()
+blob = BlobClient()
 
 DEFAULT_CUT_SETTINGS = {"pause_threshold": 0.8, "remove_fillers": True, "disabled": []}
-DEFAULT_REEL = {
-    "aspect": "9:16",
-    "cinematic": True,
-    "karaoke": True,
-    "zoom_intensity": 1.0,
-    "punch_ins": True,
-    "punch_sensitivity": 0.5,
-    "burn_captions": True,
-}
+DEFAULT_REEL = {"aspect": "9:16", "cinematic": True, "karaoke": True, "zoom_intensity": 1.0, "punch_ins": True, "punch_sensitivity": 0.5, "burn_captions": True}
+MAX_UPLOAD = 500 * 1024 * 1024
 
 
-def now_iso() -> str:
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def project_dir(pid: str) -> Path:
-    return DATA_DIR / pid
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-def get_project_or_404(pid: str) -> dict:
-    doc = projects.find_one({"id": pid}, {"_id": 0})
+def db():
+    return connect(os.environ["DATABASE_URL"], row_factory=dict_row)
+
+
+def query_one(sql, params=()):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def execute(sql, params=()):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+
+
+def project_token(request: Request):
+    token = request.headers.get("x-project-token", "") or request.query_params.get("access_token", "")
+    if len(token) < 32:
+        raise HTTPException(401, "project access token required")
+    return token
+
+
+def get_project(pid, request):
+    doc = query_one("SELECT * FROM clipcut_projects WHERE id=%s AND access_token_hash=%s", (pid, token_hash(project_token(request))))
     if not doc:
         raise HTTPException(404, "project not found")
+    return normalize(doc)
+
+
+def normalize(doc):
+    if not doc:
+        return doc
+    doc["id"] = str(doc["id"])
+    doc["size"] = doc.pop("size_bytes")
+    doc["words"] = doc.pop("transcript") or []
+    doc["text"] = doc.pop("transcript_text") or ""
+    doc["export"] = doc.pop("export_state") or {"status": "idle", "progress": 0}
+    doc["created_at"] = doc["created_at"].isoformat() if hasattr(doc["created_at"], "isoformat") else doc["created_at"]
+    doc.pop("access_token_hash", None)
     return doc
 
 
-def compute_cut_state(doc: dict) -> dict:
+def compute_cut_state(doc):
     settings = doc.get("cut_settings") or DEFAULT_CUT_SETTINGS
-    words = doc.get("words") or []
-    duration = doc.get("duration") or 0
+    words, duration = doc.get("words") or [], doc.get("duration") or 0
     spans = cuts_mod.compute_spans(words, duration, settings["pause_threshold"], settings["remove_fillers"])
     disabled = set(settings.get("disabled") or [])
     ranges = cuts_mod.keep_ranges(duration, spans, disabled)
-    for s in spans:
-        s["disabled"] = s["id"] in disabled
+    for span in spans:
+        span["disabled"] = span["id"] in disabled
     kept = sum(b - a for a, b in ranges)
     reel = doc.get("reel_settings") or DEFAULT_REEL
-    return {
-        "spans": spans,
-        "keep_ranges": ranges,
-        "kept_duration": round(kept, 2),
-        "removed_duration": round(max(0, duration - kept), 2),
-        "settings": settings,
-        "moves": zooms.plan(words, ranges, reel.get("zoom_intensity", 1.0),
-                            reel.get("punch_ins", True),
-                            reel.get("punch_sensitivity", 0.5)) if reel.get("cinematic") else [],
-    }
+    return {"spans": spans, "keep_ranges": ranges, "kept_duration": round(kept, 2), "removed_duration": round(max(0, duration-kept), 2), "settings": settings, "moves": zooms.plan(words, ranges, reel.get("zoom_intensity", 1), reel.get("punch_ins", True), reel.get("punch_sensitivity", .5)) if reel.get("cinematic") else []}
 
 
-def range_stream(path: Path, request: Request) -> StreamingResponse:
-    file_size = path.stat().st_size
-    range_header = request.headers.get("range")
-
-    def iter_file(start: int, end: int, chunk_size: int = 1024 * 1024):
-        with open(path, "rb") as f:
-            f.seek(start)
-            remaining = end - start + 1
-            while remaining > 0:
-                data = f.read(min(chunk_size, remaining))
-                if not data:
-                    break
-                remaining -= len(data)
-                yield data
-
-    headers = {"Accept-Ranges": "bytes", "Content-Type": "video/mp4"}
-    m = re.match(r"bytes=(\d+)-(\d*)", range_header) if range_header else None
-    if m:
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else file_size - 1
-        end = min(end, file_size - 1)
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        headers["Content-Length"] = str(end - start + 1)
-        return StreamingResponse(iter_file(start, end), status_code=206, headers=headers)
-    headers["Content-Length"] = str(file_size)
-    return StreamingResponse(iter_file(0, file_size - 1), headers=headers)
+def blob_put(pathname, data, content_type):
+    return blob.put(pathname, data, access="private", content_type=content_type, allow_overwrite=True)
 
 
-# ---------- Upload (chunked) ----------
+def blob_bytes(pathname):
+    value = blob.get(pathname)
+    if value is None:
+        raise HTTPException(404, "media not found")
+    return value
+
+
+def media_response(data, content_type="video/mp4", filename=None):
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, no-cache", "X-Content-Type-Options": "nosniff"}
+    if filename:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(content=data, media_type=content_type, headers=headers)
+
 
 class InitUpload(BaseModel):
     filename: str
@@ -124,178 +122,101 @@ class InitUpload(BaseModel):
 def init_upload(body: InitUpload):
     if not re.search(r"\.(mp4|mov|m4v|webm|mkv|avi)$", body.filename, re.I):
         raise HTTPException(400, "unsupported file type")
-    pid = str(uuid.uuid4())
-    pdir = project_dir(pid)
-    (pdir / "chunks").mkdir(parents=True)
-    doc = {
-        "id": pid,
-        "filename": body.filename,
-        "size": body.size,
-        "status": "uploading",
-        "error": None,
-        "duration": 0,
-        "width": 0,
-        "height": 0,
-        "words": [],
-        "text": "",
-        "cut_settings": dict(DEFAULT_CUT_SETTINGS),
-        "reel_settings": dict(DEFAULT_REEL),
-        "caption_style": "bold",
-        "export": {"status": "idle", "progress": 0, "error": None},
-        "created_at": now_iso(),
-    }
-    projects.insert_one(doc)
-    return {"project_id": pid}
+    if body.size <= 0 or body.size > MAX_UPLOAD:
+        raise HTTPException(400, "video must be between 1 byte and 500 MB")
+    pid, token = str(uuid.uuid4()), uuid.uuid4().hex + uuid.uuid4().hex
+    execute("INSERT INTO clipcut_projects (id,access_token_hash,filename,size_bytes,status,cut_settings,reel_settings) VALUES (%s,%s,%s,%s,'uploading',%s::jsonb,%s::jsonb)", (pid, token_hash(token), body.filename[:240], body.size, json.dumps(DEFAULT_CUT_SETTINGS), json.dumps(DEFAULT_REEL)))
+    return {"project_id": pid, "project_token": token}
 
 
 @api.post("/projects/{pid}/upload/chunk")
-def upload_chunk(pid: str, index: int = Form(...), chunk: UploadFile = File(...)):
-    get_project_or_404(pid)
-    dest = project_dir(pid) / "chunks" / f"{index:06d}.part"
-    with open(dest, "wb") as f:
-        shutil.copyfileobj(chunk.file, f)
+def upload_chunk(pid: str, request: Request, index: int = Form(...), chunk: UploadFile = File(...)):
+    get_project(pid, request)
+    if index < 0 or index > 1000:
+        raise HTTPException(400, "invalid chunk index")
+    data = chunk.file.read(6 * 1024 * 1024)
+    blob_put(f"clipcut/{pid}/chunks/{index:06d}.part", data, "application/octet-stream")
     return {"ok": True, "index": index}
 
 
 @api.post("/projects/{pid}/upload/complete")
-def complete_upload(pid: str):
-    doc = get_project_or_404(pid)
-    pdir = project_dir(pid)
-    chunks_dir = pdir / "chunks"
-    parts = sorted(chunks_dir.glob("*.part"))
-    if not parts:
-        raise HTTPException(400, "no chunks uploaded")
+def complete_upload(pid: str, request: Request):
+    doc = get_project(pid, request)
+    total = (doc["size"] + 5 * 1024 * 1024 - 1) // (5 * 1024 * 1024)
     ext = Path(doc["filename"]).suffix.lower() or ".mp4"
-    raw_path = pdir / f"raw{ext}"
-    with open(raw_path, "wb") as out:
-        for p in parts:
-            with open(p, "rb") as f:
-                shutil.copyfileobj(f, out)
-    shutil.rmtree(chunks_dir, ignore_errors=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / f"source{ext}"
+        with source.open("wb") as out:
+            for i in range(total):
+                out.write(blob_bytes(f"clipcut/{pid}/chunks/{i:06d}.part"))
+        try:
+            info = render_engine.probe(source)
+        except Exception as exc:
+            execute("UPDATE clipcut_projects SET status='error',error=%s,updated_at=now() WHERE id=%s", (f"Invalid video: {exc}"[:500], pid))
+            raise HTTPException(400, "file is not a valid video")
+        uploaded = blob_put(f"clipcut/{pid}/source{ext}", source.read_bytes(), "video/mp4")
+        thumb_path = None
+        try:
+            thumb = Path(tmp) / "thumb.jpg"
+            render_engine.make_thumbnail(source, thumb, min(1.0, info["duration"] / 2))
+            thumb_path = blob_put(f"clipcut/{pid}/thumb.jpg", thumb.read_bytes(), "image/jpeg").pathname
+        except Exception:
+            pass
+        execute("UPDATE clipcut_projects SET status='transcribing',source_pathname=%s,thumbnail_pathname=%s,duration=%s,width=%s,height=%s,updated_at=now() WHERE id=%s", (uploaded.pathname, thumb_path, info["duration"], info["width"], info["height"], pid))
+        try:
+            payload = transcription.transcribe_video(source)
+            execute("UPDATE clipcut_projects SET status='ready',transcript=%s::jsonb,transcript_text=%s,error=NULL,updated_at=now() WHERE id=%s", (json.dumps(payload.get("words") or []), payload.get("text") or "", pid))
+        except Exception as exc:
+            logging.exception("transcription failed")
+            execute("UPDATE clipcut_projects SET status='error',error=%s,updated_at=now() WHERE id=%s", (str(exc)[:500], pid))
+    return {"ok": True, "status": "ready", "duration": info["duration"]}
 
-    video_path = pdir / f"source{ext}"
-    remux = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(raw_path), "-c", "copy", "-movflags", "+faststart", str(video_path)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if remux.returncode == 0:
-        raw_path.unlink(missing_ok=True)
-    else:
-        raw_path.replace(video_path)
-
-    try:
-        info = render_engine.probe(video_path)
-    except Exception:
-        shutil.rmtree(pdir, ignore_errors=True)
-        projects.delete_one({"id": pid})
-        raise HTTPException(400, "file is not a valid video")
-
-    projects.update_one({"id": pid}, {"$set": {
-        "status": "transcribing",
-        "video_path": str(video_path),
-        "duration": info["duration"],
-        "width": info["width"],
-        "height": info["height"],
-    }})
-    try:
-        render_engine.make_thumbnail(video_path, pdir / "thumb.jpg", min(1.0, info["duration"] / 2))
-    except Exception:
-        pass
-    threading.Thread(target=_run_transcription, args=(pid,), daemon=True).start()
-    return {"ok": True, "status": "transcribing", "duration": info["duration"]}
-
-
-def _run_transcription(pid: str):
-    doc = projects.find_one({"id": pid})
-    try:
-        payload = transcription.transcribe_video(Path(doc["video_path"]))
-        words = payload.get("words") or []
-        projects.update_one({"id": pid}, {"$set": {
-            "status": "ready",
-            "words": words,
-            "text": payload.get("text") or "",
-        }})
-    except Exception as e:
-        projects.update_one({"id": pid}, {"$set": {"status": "error", "error": str(e)[:500]}})
-
-
-# ---------- Project library ----------
 
 @api.get("/projects")
-def list_projects(limit: int = 30):
-    docs = projects.find(
-        {},
-        {"_id": 0, "id": 1, "filename": 1, "duration": 1, "width": 1, "height": 1,
-         "status": 1, "export": 1, "created_at": 1, "reel_settings": 1, "caption_style": 1},
-    ).sort("created_at", -1).limit(max(1, min(100, limit)))
+def list_projects(request: Request, limit: int = 30):
+    raw = request.headers.get("x-project-tokens", "")
+    hashes = [token_hash(x) for x in raw.split(",") if len(x) >= 32][:100]
+    if not hashes:
+        return {"projects": []}
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM clipcut_projects WHERE access_token_hash=ANY(%s) ORDER BY created_at DESC LIMIT %s", (hashes, max(1, min(100, limit))))
+        docs = cur.fetchall()
     items = []
-    for d in docs:
-        items.append({
-            **d,
-            "export_status": (d.get("export") or {}).get("status", "idle"),
-            "has_thumb": (project_dir(d["id"]) / "thumb.jpg").exists(),
-        })
+    for doc in docs:
+        export_status = (doc.get("export_state") or {}).get("status", "idle")
+        has_thumb = bool(doc.get("thumbnail_pathname"))
+        items.append({**normalize(doc), "export_status": export_status, "has_thumb": has_thumb})
     return {"projects": items}
 
 
-@api.delete("/projects/{pid}")
-def delete_project(pid: str):
-    doc = get_project_or_404(pid)
-    cloud = doc.get("cloud") or {}
-    if cloud.get("public_id") and cloudinary_svc.enabled():
-        try:
-            cloudinary_svc.destroy(cloud["public_id"])
-        except Exception:
-            pass
-    shutil.rmtree(project_dir(pid), ignore_errors=True)
-    projects.delete_one({"id": pid})
-    return {"ok": True}
-
-
-@api.get("/projects/{pid}/thumbnail")
-def get_thumbnail(pid: str):
-    doc = get_project_or_404(pid)
-    path = project_dir(pid) / "thumb.jpg"
-    if not path.exists():
-        source = Path(doc.get("video_path") or "")
-        if not source.exists():
-            raise HTTPException(404, "thumbnail not found")
-        try:
-            render_engine.make_thumbnail(source, path, min(1.0, (doc.get("duration") or 2) / 2))
-        except Exception:
-            raise HTTPException(404, "thumbnail not available")
-    return FileResponse(path, media_type="image/jpeg")
-
-
-# ---------- Project state ----------
-
 @api.get("/projects/{pid}")
-def get_project(pid: str):
-    doc = get_project_or_404(pid)
-    doc.pop("video_path", None)
-    doc.setdefault("reel_settings", dict(DEFAULT_REEL))
+def get_project_route(pid: str, request: Request):
+    doc = get_project(pid, request)
     if doc["status"] == "ready":
         doc["cuts"] = compute_cut_state(doc)
     return doc
 
 
+@api.delete("/projects/{pid}")
+def delete_project(pid: str, request: Request):
+    doc = get_project(pid, request)
+    paths = [doc.get("source_pathname"), doc.get("thumbnail_pathname"), doc.get("export_pathname")]
+    blob.delete([p for p in paths if p])
+    execute("DELETE FROM clipcut_projects WHERE id=%s AND access_token_hash=%s", (pid, token_hash(project_token(request))))
+    return {"ok": True}
+
+
 class CutSettings(BaseModel):
-    pause_threshold: float = 0.8
+    pause_threshold: float = .8
     remove_fillers: bool = True
     disabled: list[str] = []
 
 
 @api.post("/projects/{pid}/cuts")
-def update_cuts(pid: str, body: CutSettings):
-    doc = get_project_or_404(pid)
-    if doc["status"] != "ready":
-        raise HTTPException(400, "transcript not ready")
-    settings = {
-        "pause_threshold": max(0.3, min(3.0, body.pause_threshold)),
-        "remove_fillers": body.remove_fillers,
-        "disabled": body.disabled,
-    }
-    projects.update_one({"id": pid}, {"$set": {"cut_settings": settings}})
+def update_cuts(pid: str, body: CutSettings, request: Request):
+    doc = get_project(pid, request)
+    settings = {"pause_threshold": max(.3, min(3, body.pause_threshold)), "remove_fillers": body.remove_fillers, "disabled": body.disabled}
+    execute("UPDATE clipcut_projects SET cut_settings=%s::jsonb,updated_at=now() WHERE id=%s", (json.dumps(settings), pid))
     doc["cut_settings"] = settings
     return compute_cut_state(doc)
 
@@ -305,71 +226,13 @@ class StyleBody(BaseModel):
 
 
 @api.post("/projects/{pid}/style")
-def set_style(pid: str, body: StyleBody):
-    get_project_or_404(pid)
+def set_style(pid: str, body: StyleBody, request: Request):
+    get_project(pid, request)
     if body.caption_style not in render_engine.CAPTION_STYLES:
         raise HTTPException(400, "unknown style")
-    projects.update_one({"id": pid}, {"$set": {"caption_style": body.caption_style}})
+    execute("UPDATE clipcut_projects SET caption_style=%s,updated_at=now() WHERE id=%s", (body.caption_style, pid))
     return {"ok": True}
 
-
-class ReelSettings(BaseModel):
-    aspect: str = "9:16"
-    cinematic: bool = True
-    karaoke: bool = True
-    zoom_intensity: float = 1.0
-    punch_ins: bool = True
-    punch_sensitivity: float = 0.5
-    burn_captions: bool = True
-
-
-def _clean_reel(body: ReelSettings) -> dict:
-    if body.aspect not in ("9:16", "original"):
-        raise HTTPException(400, "aspect must be 9:16 or original")
-    return {
-        "aspect": body.aspect,
-        "cinematic": body.cinematic,
-        "karaoke": body.karaoke,
-        "zoom_intensity": max(0.2, min(1.6, body.zoom_intensity)),
-        "punch_ins": body.punch_ins,
-        "punch_sensitivity": max(0.0, min(1.0, body.punch_sensitivity)),
-        "burn_captions": body.burn_captions,
-    }
-
-
-@api.post("/projects/{pid}/reel")
-def set_reel(pid: str, body: ReelSettings):
-    doc = get_project_or_404(pid)
-    settings = _clean_reel(body)
-    projects.update_one({"id": pid}, {"$set": {"reel_settings": settings}})
-    doc["reel_settings"] = settings
-    return {"reel_settings": settings, "cuts": compute_cut_state(doc) if doc["status"] == "ready" else None}
-
-
-# ---------- Video streaming ----------
-
-@api.get("/projects/{pid}/video")
-def stream_video(pid: str, request: Request):
-    doc = projects.find_one({"id": pid})
-    if not doc or not doc.get("video_path"):
-        raise HTTPException(404, "video not found")
-    path = Path(doc["video_path"])
-    if not path.exists():
-        raise HTTPException(404, "video not found")
-    return range_stream(path, request)
-
-
-@api.get("/projects/{pid}/export/video")
-def stream_export(pid: str, request: Request):
-    doc = get_project_or_404(pid)
-    export = doc.get("export") or {}
-    path = Path(export.get("path") or "")
-    if export.get("status") != "done" or not path.exists():
-        raise HTTPException(404, "export not ready")
-    return range_stream(path, request)
-
-
-# ---------- Export ----------
 
 class ExportBody(BaseModel):
     caption_style: str = "bold"
@@ -377,123 +240,82 @@ class ExportBody(BaseModel):
     aspect: str = "original"
     cinematic: bool = True
     karaoke: bool = True
-    zoom_intensity: float = 1.0
+    zoom_intensity: float = 1
     punch_ins: bool = True
-    punch_sensitivity: float = 0.5
+    punch_sensitivity: float = .5
 
 
 @api.post("/projects/{pid}/export")
-def start_export(pid: str, body: ExportBody):
-    doc = get_project_or_404(pid)
+def start_export(pid: str, body: ExportBody, request: Request):
+    doc = get_project(pid, request)
     if doc["status"] != "ready":
         raise HTTPException(400, "transcript not ready")
-    if (doc.get("export") or {}).get("status") == "processing":
-        raise HTTPException(400, "export already running")
-    if body.caption_style not in render_engine.CAPTION_STYLES:
-        raise HTTPException(400, "unknown style")
-    reel = _clean_reel(ReelSettings(
-        aspect=body.aspect, cinematic=body.cinematic, karaoke=body.karaoke,
-        zoom_intensity=body.zoom_intensity, punch_ins=body.punch_ins,
-        punch_sensitivity=body.punch_sensitivity,
-        burn_captions=body.burn_captions,
-    ))
-    projects.update_one({"id": pid}, {"$set": {
-        "caption_style": body.caption_style,
-        "reel_settings": reel,
-        "export": {"status": "processing", "progress": 0, "error": None, "stage": "cutting"},
-    }})
-    threading.Thread(target=_run_export, args=(pid, body.caption_style, reel), daemon=True).start()
+    if body.caption_style not in render_engine.CAPTION_STYLES or body.aspect not in ("9:16", "original"):
+        raise HTTPException(400, "invalid export settings")
+    reel = {"aspect": body.aspect, "cinematic": body.cinematic, "karaoke": body.karaoke, "zoom_intensity": max(.2, min(1.6, body.zoom_intensity)), "punch_ins": body.punch_ins, "punch_sensitivity": max(0, min(1, body.punch_sensitivity)), "burn_captions": body.burn_captions}
+    execute("UPDATE clipcut_projects SET caption_style=%s,reel_settings=%s::jsonb,export_state=%s::jsonb,updated_at=now() WHERE id=%s", (body.caption_style, json.dumps(reel), json.dumps({"status":"processing","progress":0,"stage":"cutting"}), pid))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            source.write_bytes(blob_bytes(doc["source_pathname"]))
+            out = root / "export.mp4"
+            state = compute_cut_state({**doc, "reel_settings": reel})
+            def progress(value):
+                stage = "cutting" if value < 68 else ("captioning" if value < 90 else "mastering")
+                execute("UPDATE clipcut_projects SET export_state=jsonb_set(jsonb_set(export_state,'{progress}',to_jsonb(%s::int)),'{stage}',to_jsonb(%s::text)),updated_at=now() WHERE id=%s", (value, stage, pid))
+            meta = render_engine.render_export(source, doc["words"], state["keep_ranges"], body.caption_style, body.burn_captions, root / "work", out, reel["aspect"], reel["cinematic"], reel["karaoke"], reel["zoom_intensity"], reel["punch_ins"], reel["punch_sensitivity"], progress)
+            uploaded = blob_put(f"clipcut/{pid}/export-{uuid.uuid4().hex[:8]}.mp4", out.read_bytes(), "video/mp4")
+            export = {"status":"done","progress":100,"stage":"done","error":None,"meta":meta,"size":out.stat().st_size,"finished_at":now_iso()}
+            execute("UPDATE clipcut_projects SET export_pathname=%s,export_state=%s::jsonb,updated_at=now() WHERE id=%s", (uploaded.pathname, json.dumps(export), pid))
+    except Exception as exc:
+        logging.exception("export failed")
+        execute("UPDATE clipcut_projects SET export_state=%s::jsonb,updated_at=now() WHERE id=%s", (json.dumps({"status":"error","progress":0,"stage":"failed","error":str(exc)[:500]}), pid))
+        raise HTTPException(500, str(exc)[:300])
     return {"ok": True, "reel_settings": reel}
 
 
-def _run_export(pid: str, style_key: str, reel: dict):
-    doc = projects.find_one({"id": pid})
-    try:
-        state = compute_cut_state({**doc, "reel_settings": reel})
-        pdir = project_dir(pid)
-        out_path = pdir / "export.mp4"
+@api.get("/projects/{pid}/video")
+def source_video(pid: str, request: Request):
+    doc = get_project(pid, request)
+    return media_response(blob_bytes(doc["source_pathname"]))
 
-        def cb(p):
-            stage = "cutting" if p < 68 else ("captioning" if p < 90 else "mastering")
-            projects.update_one({"id": pid}, {"$set": {"export.progress": p, "export.stage": stage}})
 
-        meta = render_engine.render_export(
-            source=Path(doc["video_path"]),
-            words=doc.get("words") or [],
-            ranges=state["keep_ranges"],
-            style_key=style_key,
-            burn=reel["burn_captions"],
-            work_dir=pdir / "work",
-            out_path=out_path,
-            aspect=reel["aspect"],
-            cinematic=reel["cinematic"],
-            karaoke=reel["karaoke"],
-            zoom_intensity=reel["zoom_intensity"],
-            punch_ins=reel.get("punch_ins", True),
-            punch_sensitivity=reel.get("punch_sensitivity", 0.5),
-            progress_cb=cb,
-        )
-        cloud = {}
-        if cloudinary_svc.enabled():
-            try:
-                cloud = cloudinary_svc.upload_reel(
-                    out_path, public_id=f"reel_{pid}", reframe=reel["aspect"] == "9:16"
-                )
-            except Exception as e:
-                cloud = {"error": str(e)[:300]}
-        projects.update_one({"id": pid}, {"$set": {
-            "export": {
-                "status": "done", "progress": 100, "error": None, "stage": "done",
-                "path": str(out_path), "meta": meta,
-                "size": out_path.stat().st_size,
-                "finished_at": now_iso(),
-            },
-            "cloud": cloud,
-        }})
-        shutil.rmtree(pdir / "work", ignore_errors=True)
-    except Exception as e:
-        logging.exception("export failed for %s", pid)
-        projects.update_one({"id": pid}, {"$set": {
-            "export": {"status": "error", "progress": 0, "error": str(e)[:500], "stage": "failed"},
-        }})
+@api.get("/projects/{pid}/thumbnail")
+def thumbnail(pid: str, request: Request):
+    doc = get_project(pid, request)
+    return media_response(blob_bytes(doc["thumbnail_pathname"]), "image/jpeg")
+
+
+@api.get("/projects/{pid}/export/video")
+def export_video(pid: str, request: Request):
+    doc = get_project(pid, request)
+    if not doc.get("export_pathname"):
+        raise HTTPException(404, "export not ready")
+    return media_response(blob_bytes(doc["export_pathname"]))
 
 
 @api.get("/projects/{pid}/export/download")
-def download_export(pid: str):
-    doc = get_project_or_404(pid)
-    export = doc.get("export") or {}
-    if export.get("status") != "done":
+def download(pid: str, request: Request):
+    doc = get_project(pid, request)
+    if not doc.get("export_pathname"):
         raise HTTPException(404, "export not ready")
-    path = Path(export["path"])
-    if not path.exists():
-        raise HTTPException(404, "export file missing")
-    stem = Path(doc["filename"]).stem
-    return FileResponse(path, media_type="video/mp4", filename=f"{stem}_reel.mp4")
+    return media_response(blob_bytes(doc["export_pathname"]), filename=f"{Path(doc['filename']).stem}_reel.mp4")
 
 
 @api.get("/styles")
-def list_styles():
-    return {"styles": list(render_engine.CAPTION_STYLES.keys())}
+def styles():
+    return {"styles": list(render_engine.CAPTION_STYLES)}
 
 
-@api.get("/cloudinary/status")
-def cloudinary_status():
-    return {
-        "enabled": cloudinary_svc.enabled(),
-        "cloud_name": os.environ.get("CLOUDINARY_CLOUD_NAME") or None,
-    }
+@api.get("/storage/status")
+def storage_status():
+    return {"blob": True, "database": True, "private": True}
 
 
 @api.get("/")
 def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "service": "clipcut-cloud"}
 
 app.include_router(api)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])

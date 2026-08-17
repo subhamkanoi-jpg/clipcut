@@ -7,7 +7,7 @@ export default function App() {
   const [view, setView] = useState({ mode: "studio", projectId: null });
 
   return (
-    <div className="h-screen w-full bg-background text-white overflow-hidden">
+    <div className="min-h-dvh w-full bg-background text-white md:h-screen md:overflow-hidden">
       <Toaster theme="dark" position="top-center" richColors />
       {view.mode === "editor" ? (
         <Editor

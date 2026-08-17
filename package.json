@@ -1,0 +1,8 @@
+{
+  "name": "clipcut-cloud",
+  "private": true,
+  "packageManager": "npm@10.9.2",
+  "scripts": {
+    "build": "npm --prefix frontend run build"
+  }
+}
