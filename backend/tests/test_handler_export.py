@@ -99,6 +99,57 @@ def test_export_honours_cancellation_before_render(db, monkeypatch, tmp_path):
     assert exp["stage"] == "cancelled"
 
 
+def test_export_mid_render_cancel_records_cancelled_not_error(db, monkeypatch, tmp_path):
+    # Finding 4: worker.Cancelled subclasses Exception, so a cancel raised
+    # mid-render (render_plan's own cancel_cb check) used to fall into the
+    # generic `except Exception` branch, which sets status "error" with
+    # str(Cancelled()) -- an EMPTY string -- while the job doc correctly
+    # says cancelled. The frontend then showed "Export failed: " with
+    # nothing after it. export.py must catch Cancelled first and record the
+    # same shape the pre-render cancel path uses.
+    _project(db, "p7")
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+
+    def raise_cancelled(*a, **kw):
+        raise eh.Cancelled()
+
+    monkeypatch.setattr(eh.render_plan, "render", raise_cancelled)
+    jid = jobs_mod.enqueue(db, "p7", "export",
+                           {"caption_style": "bold", "reel": dict(REEL)})
+    worker_mod.run_once(db, "w1")
+
+    assert db.jobs.find_one({"id": jid})["status"] == "cancelled"
+    exp = db.projects.find_one({"id": "p7"})["export"]
+    assert exp["status"] == "cancelled"
+    assert exp["progress"] == 0
+    assert exp["error"] is None
+    assert exp["stage"] == "cancelled"
+
+
+def test_export_missing_payload_key_does_not_strand_project_in_processing(db, monkeypatch, tmp_path):
+    # Finding 5b (third gap path): an exception raised before the handler's
+    # own try -- here, `ctx.payload["caption_style"]` on a payload missing
+    # that key -- used to leave the project's export sub-document untouched
+    # at whatever it was set to when the export was enqueued
+    # (status: "processing"), because no per-handler except block covers
+    # code before its own try. jobs.fail() now reconciles the project itself
+    # whenever a job reaches a terminal error state, regardless of where in
+    # the handler the exception came from.
+    _project(db, "p8")
+    monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)
+    db.projects.update_one({"id": "p8"}, {"$set": {
+        "export": {"status": "processing", "progress": 0, "error": None, "stage": "cutting"},
+    }})
+
+    jid = jobs_mod.enqueue(db, "p8", "export", {"reel": dict(REEL)})  # no caption_style
+    worker_mod.run_once(db, "w1")
+
+    assert db.jobs.find_one({"id": jid})["status"] == "error"
+    exp = db.projects.find_one({"id": "p8"})["export"]
+    assert exp["status"] == "error"
+    assert exp["status"] != "processing"
+
+
 def test_export_9_16_calls_subject_center_and_reaches_plan(db, monkeypatch, tmp_path):
     _project(db, "p4")
     monkeypatch.setattr(eh, "project_dir", lambda pid: tmp_path)

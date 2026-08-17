@@ -7,8 +7,8 @@ import cloudinary_svc
 import reframe
 import worker
 from cut_state import compute_cut_state, now_iso
+from errors import Cancelled
 from plan import assemble, materialize, render_plan
-from worker import Cancelled
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -58,6 +58,19 @@ def run(ctx) -> dict:
             progress_cb=cb,
             cancel_cb=ctx.cancelled,
         )
+    except Cancelled:
+        # Cancelled subclasses Exception, so it must be caught here, ahead of
+        # the generic `except Exception` below -- otherwise a cancel raised
+        # mid-render (render_plan's own cancel_cb check) falls into that
+        # branch instead, which sets status "error" with str(Cancelled()),
+        # an EMPTY string, leaving the project showing "Export failed: "
+        # with nothing after it while the job doc correctly says cancelled.
+        # Mirror the same shape the pre-render cancel path above uses.
+        ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
+            "export": {"status": "cancelled", "progress": 0,
+                       "error": None, "stage": "cancelled"},
+        }})
+        raise
     except Exception as e:
         ctx.db.projects.update_one({"id": ctx.project_id}, {"$set": {
             "export": {"status": "error", "progress": 0,
