@@ -46,8 +46,8 @@ def validate(plan: dict) -> list:
     """Return a list of human-readable errors. Empty means valid."""
     errors = []
 
-    if plan.get("version") != PLAN_VERSION:
-        errors.append(f"version must be {PLAN_VERSION}, got {plan.get('version')!r}")
+    if plan.get("version") not in (1, PLAN_VERSION):
+        errors.append(f"version must be 1 or {PLAN_VERSION}, got {plan.get('version')!r}")
 
     sources = plan.get("sources")
     if not isinstance(sources, dict) or not sources:
@@ -114,11 +114,27 @@ def validate(plan: dict) -> list:
     if reframe.get("aspect") not in VALID_ASPECTS:
         errors.append(f"reframe.aspect must be one of {VALID_ASPECTS}")
     cx = reframe.get("center_x", 0.5)
-    try:
-        if not 0.0 <= float(cx) <= 1.0:
-            errors.append(f"reframe.center_x must be in [0, 1], got {cx}")
-    except (TypeError, ValueError):
-        errors.append(f"reframe.center_x must be numeric, got {cx!r}")
+    if isinstance(cx, list):
+        for j, kf in enumerate(cx):
+            if not isinstance(kf, dict):
+                errors.append(f"reframe.center_x[{j}] must be an object")
+                continue
+            try:
+                t = float(kf["t"])
+                c = float(kf["cx"])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"reframe.center_x[{j}] needs numeric t and cx")
+                continue
+            if t < 0:
+                errors.append(f"reframe.center_x[{j}].t must be >= 0")
+            if not 0.0 <= c <= 1.0:
+                errors.append(f"reframe.center_x[{j}].cx must be in [0, 1], got {c}")
+    else:
+        try:
+            if not 0.0 <= float(cx) <= 1.0:
+                errors.append(f"reframe.center_x must be in [0, 1], got {cx}")
+        except (TypeError, ValueError):
+            errors.append(f"reframe.center_x must be numeric, got {cx!r}")
 
     for i, ov in enumerate(plan.get("overlays") or []):
         if ov.get("kind") not in VALID_OVERLAY_KINDS:

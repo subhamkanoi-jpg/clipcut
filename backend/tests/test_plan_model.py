@@ -73,6 +73,34 @@ def test_validate_rejects_center_x_out_of_range():
 
 def test_validate_rejects_wrong_version():
     p = model.new_plan("p1", "s.mp4")
+    p["version"] = 4
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert any("version" in e for e in model.validate(p))
+
+
+def test_validate_accepts_version_1():
+    p = model.new_plan("p1", "s.mp4")
     p["version"] = 1
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    assert model.validate(p) == []
+
+
+def test_validate_accepts_center_x_keyframe_list():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["center_x"] = [{"t": 0.0, "cx": 0.4}, {"t": 1.5, "cx": 0.6}]
+    assert model.validate(p) == []
+
+
+def test_validate_rejects_keyframe_with_bad_cx():
+    p = model.new_plan("p1", "s.mp4")
+    p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
+    p["reframe"]["center_x"] = [{"t": 0.0, "cx": 1.9}]
+    assert any("center_x" in e for e in model.validate(p))
+
+
+def test_validate_still_rejects_version_3():
+    p = model.new_plan("p1", "s.mp4")
+    p["version"] = 3
     p["ranges"] = [{"source": "main", "start": 0.0, "end": 2.0}]
     assert any("version" in e for e in model.validate(p))
