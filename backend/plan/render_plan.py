@@ -14,6 +14,12 @@ import render as helpers_render
 import worker
 from plan import materialize, model
 
+# The old backend/render_engine.py (deleted; see the module docstring in
+# helpers/render.py's "Animated zoom" section) rendered ClipCut at 30fps.
+# helpers/render.py's own default (24) is for the standalone `video-use`
+# skill and must not change — ClipCut pins its own rate here instead.
+CLIPCUT_FPS = 30
+
 
 def _probe_out(path: Path) -> dict:
     out = subprocess.run(
@@ -47,6 +53,8 @@ def _extract_all(plan, work_dir, cover, center_x, check_cancel=None):
             zoom=float(r.get("zoom") or 1.0),
             cover=cover,
             center_x=center_x,
+            move=r.get("move"),
+            fps=CLIPCUT_FPS,
         )
         paths.append(seg)
     return paths
@@ -67,6 +75,37 @@ def _composite(base, plan, subs_path, work_dir, edit_dir):
 
 def _master(src, out_path):
     helpers_render.apply_loudnorm_two_pass(src, out_path)
+
+
+def _moves_and_punches(plan: dict) -> tuple[list, list, int]:
+    """Rebuild the old render_engine.render_export()-shaped `moves`/`punches`
+    metadata from the EDL's per-range `move` fields, for the frontend
+    (ReelStudio.jsx reads meta.moves / meta.punches / meta.punch_count).
+
+    `moves` gets one entry per range that carries a move (mirrors
+    zooms.plan()'s one-entry-per-kept-range shape when cinematic is on), with
+    an `index` key restored so the UI can key its list by it. `punches` are
+    every range's snaps flattened into absolute source-time, sorted, capped
+    at 16 for display — `punch_count` is the *uncapped* total.
+    """
+    moves = []
+    punches = []
+    for i, r in enumerate(plan.get("ranges") or []):
+        move = r.get("move")
+        if not move:
+            continue
+        entry = dict(move)
+        entry["index"] = i
+        moves.append(entry)
+        seg_start = float(move.get("start", r.get("start", 0.0)))
+        for snap in move.get("snaps") or []:
+            punches.append({
+                "word": snap.get("word"),
+                "t": round(seg_start + float(snap.get("t", 0.0)), 2),
+                "amp": snap.get("amp"),
+            })
+    punches.sort(key=lambda p: p["t"])
+    return moves, punches[:16], len(punches)
 
 
 def render(plan: dict, project_dir: Path, out_path: Path, words: list,
@@ -102,6 +141,7 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
     base = _concat(segments, work_dir, edit_dir)
 
     subs_path = None
+    caption_count = 0
     caps = plan.get("captions") or {}
     if caps.get("burn") and words:
         check_cancel()
@@ -140,4 +180,14 @@ def render(plan: dict, project_dir: Path, out_path: Path, words: list,
     _master(composited, out_path)
 
     tick(100, "done")
-    return _probe_out(out_path)
+    moves, punches, punch_count = _moves_and_punches(plan)
+    return {
+        **_probe_out(out_path),
+        "aspect": aspect,
+        "moves": moves,
+        "punches": punches,
+        "punch_count": punch_count,
+        "center_x": round(center_x, 3),
+        "caption_events": caption_count,
+        "karaoke": bool(caps.get("burn") and caps.get("karaoke", True)),
+    }
