@@ -195,3 +195,29 @@ def test_empty_captions_do_not_reach_composite(tmp_path, monkeypatch):
     render_plan.render(plan, tmp_path, tmp_path / "out.mp4", words=words)
 
     assert composite_calls["subs_path"] is None
+
+
+def test_composite_resolves_overlays_before_compositing(tmp_path, monkeypatch):
+    from plan import overlays as ov_mod
+    from plan import model, render_plan
+
+    seen = {}
+
+    def fake_resolve(ovs, edit_dir, fetch=True):
+        seen["called"] = True
+        return [dict(o, file=str(tmp_path / "clip.mp4")) for o in ovs]
+
+    def fake_build(base, overlays, subs, out, edit_dir):
+        seen["overlay_files"] = [o.get("file") for o in overlays]
+        out.write_bytes(b"x")
+
+    monkeypatch.setattr(ov_mod, "resolve_overlays", fake_resolve)
+    monkeypatch.setattr(render_plan.helpers_render, "build_final_composite", fake_build)
+
+    (tmp_path / "base.mp4").write_bytes(b"base")
+    p = model.new_plan("p1", str(tmp_path / "source.mp4"))
+    p["overlays"] = [model.overlay("broll", 1.0, 2.0, query="x", source="mixkit", after_i=0)]
+    render_plan._composite(tmp_path / "base.mp4", p, None, tmp_path, tmp_path)
+
+    assert seen.get("called") is True
+    assert seen["overlay_files"] == [str(tmp_path / "clip.mp4")]

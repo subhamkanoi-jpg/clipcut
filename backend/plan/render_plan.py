@@ -12,7 +12,7 @@ import captions_ass
 import render as helpers_render
 from errors import Cancelled
 from hidden_proc import run as hidden_run
-from plan import materialize, model
+from plan import materialize, model, overlays as ov_mod
 
 # The old backend/render_engine.py (deleted; see the module docstring in
 # helpers/render.py's "Animated zoom" section) rendered ClipCut at 30fps.
@@ -84,8 +84,9 @@ def _concat(paths, work_dir, edit_dir):
 
 def _composite(base, plan, subs_path, work_dir, edit_dir):
     out = work_dir / "composite.mp4"
-    overlays = [o for o in (plan.get("overlays") or []) if o.get("enabled")]
-    helpers_render.build_final_composite(base, overlays, subs_path, out, edit_dir)
+    enabled = [o for o in (plan.get("overlays") or []) if o.get("enabled")]
+    resolved = ov_mod.resolve_overlays(enabled, edit_dir) if enabled else []
+    helpers_render.build_final_composite(base, resolved, subs_path, out, edit_dir)
     return out
 
 
