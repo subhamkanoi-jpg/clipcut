@@ -3,7 +3,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import reframe
 import zooms
 
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
@@ -335,7 +334,7 @@ def render_export(source: Path, words: list, ranges: list, style_key: str, burn:
     if aspect == "9:16":
         crop = crop_spec(info, aspect, 0.5)
         if crop and info["width"] > info["height"]:
-            center_x = reframe.subject_center(source)
+            # Vercel Functions do not ship OpenCV; use a centered crop fallback.
             crop = crop_spec(info, aspect, center_x)
     if progress_cb:
         progress_cb(6)

@@ -16,7 +16,8 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from psycopg import connect
 from psycopg.rows import dict_row
-from vercel.blob import BlobClient
+import requests
+from types import SimpleNamespace
 
 import cuts as cuts_mod
 import render_engine
@@ -25,7 +26,7 @@ import zooms
 
 app = FastAPI(title="ClipCut Cloud API")
 api = APIRouter()
-blob = BlobClient()
+BLOB_BASE_URL = "https://blob.vercel-storage.com"
 
 DEFAULT_CUT_SETTINGS = {"pause_threshold": 0.8, "remove_fillers": True, "disabled": []}
 DEFAULT_REEL = {"aspect": "9:16", "cinematic": True, "karaoke": True, "zoom_intensity": 1.0, "punch_ins": True, "punch_sensitivity": 0.5, "burn_captions": True}
@@ -95,15 +96,37 @@ def compute_cut_state(doc):
     return {"spans": spans, "keep_ranges": ranges, "kept_duration": round(kept, 2), "removed_duration": round(max(0, duration-kept), 2), "settings": settings, "moves": zooms.plan(words, ranges, reel.get("zoom_intensity", 1), reel.get("punch_ins", True), reel.get("punch_sensitivity", .5)) if reel.get("cinematic") else []}
 
 
+def _blob_headers(content_type=None):
+    headers = {"Authorization": f"Bearer {os.environ['BLOB_READ_WRITE_TOKEN']}"}
+    if content_type:
+        headers["x-content-type"] = content_type
+        headers["Content-Type"] = content_type
+    return headers
+
+
 def blob_put(pathname, data, content_type):
-    return blob.put(pathname, data, access="private", content_type=content_type, allow_overwrite=True)
+    response = requests.put(
+        f"{BLOB_BASE_URL}/{pathname}",
+        data=data,
+        headers={**_blob_headers(content_type), "x-allow-overwrite": "true"},
+        timeout=120,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Blob upload failed: {response.status_code} {response.text[:300]}")
+    return SimpleNamespace(pathname=pathname)
 
 
 def blob_bytes(pathname):
-    value = blob.get(pathname)
-    if value is None:
+    response = requests.get(
+        f"{BLOB_BASE_URL}/{pathname}",
+        headers=_blob_headers(),
+        timeout=120,
+    )
+    if response.status_code == 404:
         raise HTTPException(404, "media not found")
-    return value
+    if response.status_code >= 300:
+        raise RuntimeError(f"Blob download failed: {response.status_code}")
+    return response.content
 
 
 def media_response(data, content_type="video/mp4", filename=None):
