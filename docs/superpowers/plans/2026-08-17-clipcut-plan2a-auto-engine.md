@@ -925,7 +925,17 @@ git commit -m "feat: resolve overlay media inside the render composite step"
 **Files:**
 - Create: `backend/handlers/plan.py`
 - Modify: `backend/worker.py` (`_register_handlers` imports it)
+- Modify: `backend/jobs.py` (register a `plan` reconciler)
 - Test: `backend/tests/test_handler_plan.py`
+
+**Why the jobs.py change:** `jobs.py` has a `PROJECT_RECONCILERS` dict mapping job
+kind → a function that resets the project's sub-document when a job reaches a
+terminal state outside its handler (lease expiry, no-handler, exceeded attempts,
+mid-render cancel). Today it has `transcribe` and `export` entries. The `plan`
+job introduces `plan_status` (`"planning"` → `"ready"`), so without a `plan`
+reconciler a plan job that fails on a non-handler path would strand
+`plan_status` at `"planning"` forever. This is the exact gap the whole-branch
+re-review flagged for the next sub-project.
 
 **Interfaces:**
 - Consumes: `Ctx`/`worker.HANDLERS`; `cut_state.compute_cut_state`; `plan.assemble.from_project`; `plan.materialize.write`; `plan.overlays.overlays_from_picks`; `plan.providers.heuristic.HeuristicProvider`; `plan.providers.base.PlanContext`.
@@ -1114,6 +1124,46 @@ def _register_handlers() -> None:
     import handlers.export      # noqa: F401
     import handlers.plan        # noqa: F401
 ```
+
+Register the `plan` reconciler in `backend/jobs.py`. Add the function next to the
+existing `_reconcile_transcribe_project` / `_reconcile_export_project`:
+
+```python
+def _reconcile_plan_project(db, project_id: str, status: str, error: str | None) -> None:
+    # A stranded plan job should not leave plan_status at "planning".
+    db.projects.update_one({"id": project_id}, {"$set": {
+        "plan_status": "error" if status == "error" else status,
+    }})
+```
+
+and add it to the `PROJECT_RECONCILERS` dict:
+
+```python
+PROJECT_RECONCILERS = {
+    "transcribe": _reconcile_transcribe_project,
+    "export": _reconcile_export_project,
+    "plan": _reconcile_plan_project,
+}
+```
+
+Add a test to `backend/tests/test_handler_plan.py` asserting a plan job with no
+registered handler substitute — or more directly, a plan job whose provider
+raises — leaves `plan_status` at `"error"`, never `"planning"`:
+
+```python
+def test_plan_job_failure_resets_plan_status(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(ph, "project_dir", lambda pid: tmp_path)
+    _project(db, tmp_path)
+    db.projects.update_one({"id": "p1"}, {"$set": {"plan_status": "planning"}})
+    monkeypatch.setattr(ph, "compute_cut_state",
+                        lambda doc: (_ for _ in ()).throw(RuntimeError("boom")))
+    jobs_mod.enqueue(db, "p1", "plan")
+    worker_mod.run_once(db, "w1")
+    assert db.projects.find_one({"id": "p1"})["plan_status"] == "error"
+```
+
+(That test monkeypatches `compute_cut_state` on the handler module, so import it
+into `handlers/plan.py`'s namespace as shown — `from cut_state import compute_cut_state`.)
 
 - [ ] **Step 4: Run to verify pass**
 
