@@ -62,5 +62,16 @@ def test_provider_returns_none_on_schema_violation(tmp_path, monkeypatch):
     assert claude_cli.ClaudeCliProvider().plan(_ctx(tmp_path)) is None
 
 
+def test_provider_returns_none_on_nonzero_exit_even_with_valid_picks(tmp_path, monkeypatch):
+    def fake_run(ctx):
+        (ctx.edit_dir / "picks.json").write_text(json.dumps({
+            "visuals": [{"kind": "broll", "after_i": 0, "query": "x", "duration_s": 2.0}]
+        }), encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(claude_cli, "_invoke_claude", fake_run)
+    assert claude_cli.ClaudeCliProvider().plan(_ctx(tmp_path)) is None
+
+
 def test_name_is_claude():
     assert claude_cli.ClaudeCliProvider().name == "claude"

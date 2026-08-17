@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -44,8 +43,10 @@ class ClaudeCliProvider:
     def plan(self, ctx: PlanContext) -> dict | None:
         try:
             brief.write_brief(ctx)
-            _invoke_claude(ctx)
+            returncode = _invoke_claude(ctx)
         except Exception:
+            return None
+        if returncode != 0:
             return None
         picks_path = Path(ctx.edit_dir) / "picks.json"
         if not picks_path.is_file():

@@ -11,6 +11,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "helpers"))
 import jobs as jobs_mod
 import worker as worker_mod
 import handlers.plan as ph
+import plan.providers.claude_cli as claude_cli
+
+
+# ClaudeCliProvider is first in the plan handler's provider chain (Task 8).
+# Left unstubbed, every test below that enqueues a `plan` job would spawn a
+# real `claude` subprocess -- slow, non-deterministic, and dependent on a
+# local binary/auth. This autouse fixture stubs `_invoke_claude` to a no-op
+# that writes no picks.json, so ClaudeCliProvider.plan() deterministically
+# returns None and the chain falls through to the heuristic provider.
+#
+# test_real_claude_end_to_end (below) opts out by name so it can still drive
+# the real chain on demand.
+@pytest.fixture(autouse=True)
+def _stub_claude_invocation(request, monkeypatch):
+    if request.node.name == "test_real_claude_end_to_end":
+        yield
+        return
+    monkeypatch.setattr(claude_cli, "_invoke_claude", lambda ctx: 0)
+    yield
 
 
 @pytest.fixture
@@ -51,12 +70,10 @@ def test_plan_job_stores_a_plan_with_overlays(db, tmp_path, monkeypatch):
 
     doc = db.projects.find_one({"id": "p1"})
     assert doc["plan_status"] == "ready"
-    # ClaudeCliProvider is tried first (Task 8). The `claude` binary is a real
-    # install on this machine and is not stubbed in this handler-level test, so
-    # it may or may not produce a valid picks.json against this fixture project
-    # depending on the environment: "claude" if it did, "heuristic" if the
-    # chain fell through. Either is a correct outcome here.
-    assert doc["plan_provider"] in ("heuristic", "claude")
+    # ClaudeCliProvider is tried first (Task 8), but `_invoke_claude` is
+    # stubbed by the autouse fixture above to write no picks.json, so the
+    # chain deterministically falls through to the heuristic provider.
+    assert doc["plan_provider"] == "heuristic"
     plan = doc["plan"]
     assert plan["version"] == 2
     assert isinstance(plan["overlays"], list)
@@ -97,3 +114,27 @@ def test_plan_job_failure_resets_plan_status(db, tmp_path, monkeypatch):
     jobs_mod.enqueue(db, "p1", "plan")
     worker_mod.run_once(db, "w1")
     assert db.projects.find_one({"id": "p1"})["plan_status"] == "error"
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPCUT_TEST_CLAUDE") != "1",
+    reason="set CLIPCUT_TEST_CLAUDE=1 to exercise the real claude binary",
+)
+def test_real_claude_end_to_end(db, tmp_path, monkeypatch):
+    # Deliberately does NOT stub claude_cli._invoke_claude (the autouse
+    # fixture above opts out for this test by name), so this drives the real
+    # `claude` CLI through the full provider chain. Skipped by default so the
+    # default suite never spawns a real `claude` process; opt in explicitly
+    # with CLIPCUT_TEST_CLAUDE=1 to exercise this end-to-end path.
+    monkeypatch.setattr(ph, "project_dir", lambda pid: tmp_path)
+    _project(db, tmp_path)
+    jobs_mod.enqueue(db, "p1", "plan")
+    worker_mod.run_once(db, "w1")
+
+    doc = db.projects.find_one({"id": "p1"})
+    assert doc["plan_status"] == "ready"
+    assert doc["plan_provider"] in ("claude", "heuristic")
+    plan = doc["plan"]
+    assert plan["version"] == 2
+    assert isinstance(plan["overlays"], list)
+    assert len(plan["overlays"]) >= 1
