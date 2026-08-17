@@ -59,3 +59,25 @@ def test_no_words_produces_empty_file_and_zero_count(tmp_path):
 def test_chunks_respect_max_words():
     chunks = captions_ass.timeline_chunks(WORDS, RANGES, max_words=2)
     assert all(len(c["words"]) <= 2 for c in chunks)
+
+
+def test_build_ass_writes_utf8_for_words_outside_cp1252(tmp_path):
+    # Finding 7: build_ass() used to write_text() with no encoding=, which
+    # on Windows defaults to cp1252. libass always reads .ass files as
+    # UTF-8, so any non-ASCII word either mojibakes or -- for a character
+    # genuinely outside cp1252's range, like this one -- raises
+    # UnicodeEncodeError and fails the export outright. This word is
+    # Japanese script, which cp1252 cannot represent at all, so this test
+    # would raise (not just assert-fail) on the pre-fix code on Windows.
+    non_cp1252_words = [
+        {"text": "hello", "start": 0.0, "end": 0.4, "type": "word"},
+        {"text": "日本語", "start": 0.4, "end": 0.9, "type": "word"},  # 日本語
+    ]
+    out = tmp_path / "unicode.ass"
+    n = captions_ass.build_ass(
+        non_cp1252_words, RANGES, out, captions_ass.CAPTION_STYLES["bold"], 1080, 1920,
+        karaoke=False,
+    )
+    assert n > 0
+    text = out.read_text(encoding="utf-8")
+    assert "日本語" in text

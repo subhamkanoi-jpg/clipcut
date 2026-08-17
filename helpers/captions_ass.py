@@ -103,7 +103,11 @@ def build_ass(words: list, ranges: list, out_path: Path, style: dict,
               fonts_dir: Path | None = None) -> int:
     chunks = timeline_chunks(words, ranges)
     if not chunks:
-        out_path.write_text("")
+        # encoding="utf-8" matters even for an empty file: write_text()'s
+        # default is the platform locale encoding (cp1252 on Windows), and
+        # mixing encodings across the two write_text() calls in this
+        # function would be an easy way to reintroduce the bug below.
+        out_path.write_text("", encoding="utf-8")
         return 0
 
     scale = height / 1080
@@ -163,5 +167,10 @@ def build_ass(words: list, ranges: list, out_path: Path, style: dict,
         f"Dialogue: 0,{_ass_ts(a)},{_ass_ts(b)},Cap,,0,0,0,,{txt}"
         for a, b, txt in events if txt.strip()
     ]
-    out_path.write_text(header + "\n" + "\n".join(lines) + "\n")
+    # libass reads .ass files as UTF-8 regardless of platform. write_text()'s
+    # default encoding is the platform locale encoding -- cp1252 on Windows
+    # -- which mojibakes any non-ASCII transcript word in the burned
+    # captions, or raises UnicodeEncodeError outright for a character
+    # outside cp1252's range and fails the export.
+    out_path.write_text(header + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
     return len(lines)
