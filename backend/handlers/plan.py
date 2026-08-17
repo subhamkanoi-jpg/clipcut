@@ -18,8 +18,8 @@ def project_dir(pid: str) -> Path:
 
 
 def _provider_chain():
-    # Task 8 prepends ClaudeCliProvider here.
-    return [HeuristicProvider()]
+    from plan.providers.claude_cli import ClaudeCliProvider
+    return [ClaudeCliProvider(), HeuristicProvider()]
 
 
 def run(ctx) -> dict:
